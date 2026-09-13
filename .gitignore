@@ -1,0 +1,6 @@
+/target
+
+# agent / IDE 内部数据与驱动日志（不含项目源码）
+.codebuddy/
+.workbuddy/
+NVIDIA*/

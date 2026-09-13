@@ -1,0 +1,132 @@
+[package]
+name = "ngy-image-viewer"
+version = "0.1.0"
+edition = "2024"
+description = "极速跨平台图片查看器：双击图片，瞬间打开"
+license = "Apache-2.0"
+
+[lib]
+name = "ngy_image_viewer"
+path = "src/lib.rs"
+
+[[bin]]
+name = "ngy-image-viewer"
+path = "src/main.rs"
+
+[dependencies]
+# UI / 渲染：基于 Zed GPUI 的综合性桌面框架（Apache-2.0）
+gpui-kit = "0.6"
+anyhow = "1.0"
+
+# 栅格图像解码：PNG/JPEG/GIF/BMP/WebP/TIFF/ICO/PNM/TGA/DDS/HDR/EXR/QOI 等。
+#
+# 刻意关掉默认特性：默认特性里的 `avif` 只是 AVIF **编码**能力（ravif → rav1e），
+# 解码仍然需要 dav1d（C 库）。我们既不需要 AVIF 编码，也不接受 C 依赖，
+# 关掉它能省下 rav1e 这一大坨编译时间，顺带缩小二进制。
+image = { version = "0.25", default-features = false, features = [
+    "bmp",
+    "dds",
+    "exr",
+    "ff",
+    "gif",
+    "hdr",
+    "ico",
+    "jpeg",
+    "png",
+    "pnm",
+    "qoi",
+    "rayon",
+    "tga",
+    "tiff",
+    "webp",
+] }
+
+# EXIF 元数据：方向纠正与拍摄参数读取。
+# 注意包名是 `kamadak-exif`，而它的库名才是 `exif`（crates.io 上的 `exif` 是另一个无关包）。
+kamadak-exif = "0.6"
+
+# JPEG XL：纯 Rust 实现，支持两种封装（裸 codestream / ISOBMFF 容器）。
+jxl-oxide = "0.12"
+
+# SVG 矢量图：usvg 解析 + resvg 栅格化 + tiny-skia 光栅后端，全部纯 Rust。
+#
+# 版本刻意与 gpui 自己依赖的 resvg 对齐（见 Cargo.lock）：否则会同时编进两份
+# resvg/usvg/svgtypes，白白拖慢构建、撑大二进制。
+# `raster-images` 让 SVG 里内嵌的位图能被解析（图标内嵌 PNG 很常见）；
+# `text` + `system-fonts` 让 `<text>` 能真正渲染出字，而不是留空。
+#
+# 只依赖 `resvg` 而不单独依赖 `usvg`：resvg 会 re-export 它所用的 usvg，
+# 这样两个 crate 的版本永远一致，不会出现「解析用 A 版、光栅化用 B 版」的隐性错配。
+resvg = { version = "0.46", default-features = false, features = [
+    "text",
+    "system-fonts",
+    "raster-images",
+    "memmap-fonts",
+] }
+
+# 相机 RAW 原片：rawloader 只负责解出 CFA 马赛克数据与元信息，
+# 去马赛克由我们自己的 `decode/demosaic.rs` 完成（双线性 + 分块并行）。
+rawloader = "0.37"
+
+# 数据并行：RAW 去马赛克是纯计算、逐像素独立的典型场景，按行切分即可线性加速。
+# `image` 的 `rayon` 特性已经把它拉进依赖树，这里只是显式声明以便直接使用。
+rayon = "1.10"
+
+# 文件能力。
+#
+# `trash` 关掉默认特性里的 `chrono`（我们不需要时间戳），只保留 COM 单元初始化方式：
+# 删除动作在 UI 线程上执行，那里已经是单元线程模型。
+# 删除**默认走回收站**而不是直接抹掉 —— 误删一张照片不该是不可恢复的。
+trash = { version = "5", default-features = false, features = [
+    "coinit_apartmentthreaded",
+] }
+# 复制图像到系统剪贴板。`image-data` 是默认特性的一部分，正是我们需要的那个。
+arboard = "3"
+# 另存为 / 重命名的原生文件对话框。
+# 注意它的对话框是**阻塞**的，必须在后台线程上弹，否则界面会冻住。
+rfd = "0.17"
+
+# HEIC/HEIF 与 AVIF：都走系统原生解码器（见 `src/decode/heic.rs` 与 `src/decode/avif.rs`）。
+#
+# 这两个格式的图像数据分别是 HEVC 与 AV1 编码。自己接需要一个成熟的视频解码器
+# 外加一整套 YUV→RGB 色彩换算，而三大桌面系统都已内置这两种解码能力。
+# 因此 Windows 用 WIC（系统扩展）、macOS 用 ImageIO、Linux 用 libheif / libavif，
+# 从而避免引入 C 构建链，也避免提交无法验证的 `unsafe` 解码代码。
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.62", features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Imaging",
+    "Win32_System_Com",
+    "Win32_System_Com_StructuredStorage",
+    "Win32_System_Variant",
+] }
+
+[dev-dependencies]
+# 集成测试需要用同一个 image 现场生成样本文件（只写 PNG）。
+# 特性单独声明而不是吃默认值：否则测试构建会把 AVIF 编码器等一堆用不上的东西拉进来。
+image = { version = "0.25", default-features = false, features = ["png"] }
+
+# ---------------------------------------------------------------------------
+# 构建 profile：一切为「启动快、打开快」服务
+# ---------------------------------------------------------------------------
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = true
+
+# gpui-kit 官方要求：debug 构建下这些依赖不做优化会导致渲染明显变慢，
+# 单独为它们开启优化，避免再退回到「debug 跑不动」的老问题。
+[profile.dev.package]
+gpui-kit = { opt-level = 3 }
+gpui-kit-assets = { opt-level = 3 }
+gpui-component = { opt-level = 3 }
+gpui-base = { opt-level = 3 }
+gpui-pre = { opt-level = 3 }
+gpui-pre-macros = { opt-level = 3 }
+gpui-pre-platform = { opt-level = 3 }
+rustybuzz = { opt-level = 3 }
+taffy = { opt-level = 3 }
+ttf-parser = { opt-level = 3 }

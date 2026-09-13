@@ -1,0 +1,8 @@
+# Windows MSVC：静态链接 CRT。
+# 目的：消除启动期对 VC++ Redistributable DLL（vcruntime140.dll 等）的查找与加载开销，
+# 同时让便携版无需用户安装运行库。
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]
+
+[target.aarch64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]
