@@ -32,7 +32,9 @@
 //! 另存为的可用格式会自动跟着变，不会出现「UI 说能存、编码时才报错」的错配。
 
 pub mod file_ops;
+pub mod neighbors;
 
+pub use neighbors::{Neighbors, NeighborsTask};
 pub use file_ops::{
     Bitmap, FileOpError, copy_to_clipboard, delete_to_trash, pick_rename_path, pick_save_path,
     rename, save_bitmap, suggest_save_name, writable_format_for,

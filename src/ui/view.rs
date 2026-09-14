@@ -24,6 +24,7 @@
 //! | R / Shift+R | 顺时针 / 逆时针旋转 90° |
 //! | H / V | 水平 / 垂直翻转 |
 //! | I | 信息面板 |
+//! | ↑ / ↓ | 同目录里的上一个 / 下一个图片（目录在后台异步读取） |
 //! | Ctrl+O / Ctrl+C / Ctrl+S | 打开 / 复制 / 另存为 |
 //! | 标题栏菜单 | 文件 / 编辑 / 视图，全部动作与上表同一份实现 |
 //! | 拖入文件 | 直接打开 |
@@ -39,6 +40,7 @@ use gpui_kit::*;
 
 use crate::decode::{ImageData, orientation};
 use crate::fs_ops::file_ops::{self, Bitmap};
+use crate::fs_ops::neighbors::NeighborsTask;
 use crate::input::{PanGesture, zoom_factor_from_lines, zoom_factor_from_pixels};
 use crate::model::{ImageDocument, Size as ImageSize, Vec2, ViewTransform, ZoomMode};
 use crate::open_job::{OpenTask, OpenOutcome};
@@ -97,6 +99,15 @@ pub struct ImageViewerView {
     /// 后台打开任务。就绪或失败后置空。
     task: Option<OpenTask>,
 
+    /// 同目录邻居（上一个 / 下一个图片）。由 `neighbors_task` 在后台算出。
+    neighbors: Option<crate::fs_ops::Neighbors>,
+    /// 后台目录扫描任务。就绪后置空。
+    ///
+    /// 与解码一样在独立线程上跑：一个装了几万张图的文件夹可以慢到上百毫秒，
+    /// 绝不能让它在「双击即见图」的关键路径上。首帧不等它，↑/↓ 在它就绪前
+    /// 按下只会得到一句「正在读取目录」的提示。
+    neighbors_task: Option<NeighborsTask>,
+
     transform: ViewTransform,
     viewport: ViewportSlot,
     /// 上一次渲染时画布的尺寸，用来判断「窗口变了没有」。
@@ -136,6 +147,8 @@ impl ImageViewerView {
             surface: None,
             phase: Phase::Empty,
             task: None,
+            neighbors: None,
+            neighbors_task: None,
             transform: ViewTransform::default(),
             viewport: ViewportSlot::default(),
             last_viewport: ImageSize::ZERO,
@@ -172,6 +185,8 @@ impl ImageViewerView {
             name: file_name_of(path),
         };
         self.task = Some(task);
+        // 旧目录的邻居列表对新图没有意义，先清掉；新列表由 accept 成功后重新派发。
+        self.neighbors = None;
     }
 
     fn accept(&mut self, outcome: OpenOutcome) {
@@ -190,12 +205,17 @@ impl ImageViewerView {
                         self.transform = ViewTransform::default();
                         self.transform
                             .actual_size(1.0, document.logical_size(), self.last_viewport);
+                        // 邻居列表与首帧并行：目录枚举在自己的线程上跑，
+                        // 这里只是派发，不等待 —— 首帧时刻一分都不让。
+                        // 路径要先取走：document 马上被移进 self.document。
+                        let doc_path = document.path().to_path_buf();
                         self.document = Some(document);
                         self.surface = Some(Arc::new(surface));
                         self.phase = Phase::Ready;
                         self.pan.end();
                         self.frame_index = 0;
                         self.animation_started = Instant::now();
+                        self.neighbors_task = Some(NeighborsTask::spawn(doc_path));
                         trace::step(
                             "view",
                             format!(
@@ -252,6 +272,18 @@ impl ImageViewerView {
         };
         self.task = None;
         self.accept(outcome);
+    }
+
+    /// 每次渲染前把目录扫描的结果取回来（与 `pump_task` 同一条时序约定）。
+    fn pump_neighbors(&mut self) {
+        let Some(task) = self.neighbors_task.as_mut() else {
+            return;
+        };
+        let Some(neighbors) = task.poll() else {
+            return;
+        };
+        self.neighbors_task = None;
+        self.neighbors = Some(neighbors);
     }
 
     // ---- 供面板调用的动作 ----
@@ -357,6 +389,8 @@ impl ImageViewerView {
 
         match command {
             Command::Open => self.open_dialog(cx),
+            Command::PreviousFile => self.open_neighbor(-1, cx),
+            Command::NextFile => self.open_neighbor(1, cx),
             Command::SaveAs => self.save_as(cx),
             Command::Rename => self.rename(cx),
             Command::DeleteToTrash => self.delete_to_trash(cx),
@@ -564,6 +598,26 @@ impl ImageViewerView {
         cx.notify();
     }
 
+    /// 打开同目录里的上一个 / 下一个图片（`offset` 为 -1 或 1）。
+    fn open_neighbor(&mut self, offset: isize, cx: &mut Context<Self>) {
+        // 列表还没就绪：说明而不是装作没按到 —— 大目录的枚举要一点时间，
+        // 用户按了没反应会以为键盘坏了。
+        let Some(neighbors) = self.neighbors.as_ref() else {
+            self.push_toast("正在读取目录…", ToastKind::Info);
+            return;
+        };
+        let target = if offset < 0 {
+            neighbors.previous.clone()
+        } else {
+            neighbors.next.clone()
+        };
+        let Some(path) = target else {
+            self.push_toast("目录里没有其他图片", ToastKind::Info);
+            return;
+        };
+        self.open_path(path, cx);
+    }
+
     fn push_toast(&mut self, text: impl Into<String>, kind: ToastKind) {
         self.toasts.push(Toast {
             text: text.into(),
@@ -610,7 +664,7 @@ impl ImageViewerView {
             .as_ref()
             .map(|surface| surface.is_animated())
             .unwrap_or(false);
-        animating || !self.toasts.is_empty() || self.task.is_some()
+        animating || !self.toasts.is_empty() || self.task.is_some() || self.neighbors_task.is_some()
     }
 
     // ---- 交互 ----
@@ -875,6 +929,7 @@ impl Render for ImageViewerView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         // 1. 先把后台结果收回来 —— 这一帧就能显示图像，而不是等到下一帧。
         self.pump_task();
+        self.pump_neighbors();
 
         // 2. 画布尺寸可能刚刚变化（首帧时它还是零），据此重算「适应窗口」。
         let measured = self.viewport.get();

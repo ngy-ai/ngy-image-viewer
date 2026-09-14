@@ -389,7 +389,10 @@ pub fn pick_open_path() -> Option<PathBuf> {
 }
 
 /// 「打开」对话框里预置的图片扩展名。
-const IMAGE_EXTENSIONS: &[&str] = &[
+///
+/// `pub(crate)`：目录导航（`neighbors.rs`）用它筛选同目录的候选文件，
+/// 两处必须始终是同一份列表 —— 导航跳过去却打不开的文件，比不跳更糟。
+pub(crate) const IMAGE_EXTENSIONS: &[&str] = &[
     "png", "jpg", "jpeg", "jpe", "gif", "webp", "bmp", "tif", "tiff", "ico", "svg", "tga", "dds",
     "qoi", "pnm", "ppm", "pgm", "pbm", "hdr", "exr", "jxl", "heic", "heif", "avif", "nef", "nrw",
     "arw", "srf", "sr2", "cr2", "cr3", "dng", "orf", "rw2", "raf", "pef", "srw", "jxr", "wdp",

@@ -26,6 +26,10 @@ pub const APP_NAME: &str = "ngy-image-viewer";
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Command {
     Open,
+    /// 同目录里的上一个图片（↑）。
+    PreviousFile,
+    /// 同目录里的下一个图片（↓）。
+    NextFile,
     SaveAs,
     Rename,
     DeleteToTrash,
@@ -48,6 +52,8 @@ impl Command {
     pub fn label(self) -> &'static str {
         match self {
             Self::Open => "打开…",
+            Self::PreviousFile => "上一个文件",
+            Self::NextFile => "下一个文件",
             Self::SaveAs => "另存为…",
             Self::Rename => "重命名…",
             Self::DeleteToTrash => "移到回收站",
@@ -183,6 +189,23 @@ pub const KEY_BINDINGS: &[Binding] = &[
         shift: false,
         display: "O",
         command: Command::Open,
+    },
+    // 上下方向键 = 同目录导航。这是看图器的本能操作：看第一张之前手已经
+    // 放在了方向键上，所以不带任何修饰键。邻居列表在后台线程里异步准备，
+    // 没就绪时按下会有提示（见 view.rs 的 open_neighbor）。
+    Binding {
+        keys: &["up"],
+        control: false,
+        shift: false,
+        display: "↑",
+        command: Command::PreviousFile,
+    },
+    Binding {
+        keys: &["down"],
+        control: false,
+        shift: false,
+        display: "↓",
+        command: Command::NextFile,
     },
     Binding {
         keys: &["s"],
