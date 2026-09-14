@@ -143,9 +143,36 @@ pub fn sniff_magic(head: &[u8]) -> Option<ImageFormat> {
     if head.starts_with(b"#?RADIANCE") || head.starts_with(b"#?RGBE") {
         return Some(ImageFormat::Hdr);
     }
-    // ICO 目录头。CUR（00 00 02 00）不在支持范围内，因此不认。
+    // JPEG XR（HD Photo）裸 codestream 的签名：小端 `II\xBC\x01` 或大端 `MM\x00\xBC`。
+    // 这与 TIFF 的 `II\x2a\x00` / `MM\x00\x2a` 仅第 3 字节不同，不会混淆。
+    if head.starts_with(&[0x49, 0x49, 0xBC, 0x01]) || head.starts_with(&[0x4D, 0x4D, 0x00, 0xBC]) {
+        return Some(ImageFormat::Jxr);
+    }
+    // ICO 目录头：保留字段（恒为 0）+ 类型字段（1 = 图标）。
+    // 注意：**不**在此识别 CUR（`00 00 02 00`）—— TGA 类型 2 的头部同样是
+    // `00 00 02 00`，靠魔数无法区分，CUR 改为只靠扩展名 + 解码器的 ICONDIR 校验兜底。
     if head.starts_with(&[0x00, 0x00, 0x01, 0x00]) {
         return Some(ImageFormat::Ico);
+    }
+    // Photoshop 文档（`.psd` / `.psb`）：签名 `8BPS`。它与任何已知图片格式都不冲突，
+    // 可以放心靠魔数识别；版本号 1 / 2（PSB）的差异由解码器区分。
+    if head.starts_with(b"8BPS") {
+        return Some(ImageFormat::Psd);
+    }
+    // JPEG 2000 系列：JP2/JPX/MJ2 容器的标准 `jP` box 签名（12 字节）。
+    // 这是 JP2 容器最稳的内容特征；`.j2k` 裸 codestream 另走下方 `FF 4F FF 51` 判定。
+    if head.len() >= 12
+        && head.starts_with(&[
+            0x00, 0x00, 0x00, 0x0C, 0x6A, 0x50, 0x20, 0x20, 0x0D, 0x0A, 0x87, 0x0A,
+        ])
+    {
+        return Some(ImageFormat::Jp2);
+    }
+    // JPEG 2000 裸 codestream（`.j2k`）：SOC 标记 `FF 4F` 紧跟 SIZ 标记 `FF 51`。
+    // 注意 WIC 的 JPEG2000 解码器通常只接受 JP2 容器，裸 codestream 可能解不出，
+    // 这里仍识别为 Jp2，以便走统一的「缺组件/不支持」提示而不是静默失败。
+    if head.starts_with(&[0xFF, 0x4F, 0xFF, 0x51]) {
+        return Some(ImageFormat::Jp2);
     }
     // JPEG XL 裸 codestream（另一种封装是容器，见下）。
     if head.starts_with(&[0xFF, 0x0A]) {
@@ -156,6 +183,28 @@ pub fn sniff_magic(head: &[u8]) -> Option<ImageFormat> {
         0x00, 0x00, 0x00, 0x0C, b'J', b'X', b'L', b' ', 0x0D, 0x0A, 0x87, 0x0A,
     ]) {
         return Some(ImageFormat::Jxl);
+    }
+
+    // FLIF（Free Lossless Image Format）：4 字节 ASCII 魔数 `FLIF`，无歧义。
+    if head.starts_with(b"FLIF") {
+        return Some(ImageFormat::Flif);
+    }
+
+    // MNG / JNG：与 PNG 同源的 8 字节签名（`\x8a`/`\x8b` + "MNG"/"JNG" + `\r\n\x1a\n`）。
+    // 这两个容器在 Rust 生态里没有任何解码库，这里只负责「识别」，
+    // 真解码会由 mng 解码器给出可操作的拒绝提示（见 `src/decode/mng.rs`）。
+    if head.starts_with(&[0x8A, b'M', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A]) {
+        return Some(ImageFormat::Mng);
+    }
+    if head.starts_with(&[0x8B, b'J', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A]) {
+        return Some(ImageFormat::Jng);
+    }
+
+    // PICT（Apple QuickDraw picture）：版本 2 在偏移 10 处有 `00 11 02 FF`，
+    // 版本 1 在偏移 10 处有 `11 01`；完整文件常带 512 字节启动桩，桩后才是图片记录，
+    // 因此偏移 0 与 512 两处都要试。
+    if looks_like_pict(head) {
+        return Some(ImageFormat::Pict);
     }
 
     // ---- 容器类，需要看容器内部的标识 ----
@@ -196,7 +245,57 @@ pub fn sniff_magic(head: &[u8]) -> Option<ImageFormat> {
         return Some(ImageFormat::Svg);
     }
 
+    // XBM / XPM：纯文本 C 数组，没有固定二进制魔数，只能靠文本特征识别。
+    // 放在 SVG 之后、收尾之前：它们都不含 `<svg`，SVG 也不含 XBM/XPM 的特征串。
+    if looks_like_xbm(head) {
+        return Some(ImageFormat::Xbm);
+    }
+    if looks_like_xpm(head) {
+        return Some(ImageFormat::Xpm);
+    }
+
     None
+}
+
+/// PICT 图片记录特征：版本 2 在记录内偏移 10 处是 `00 11 02 FF`，版本 1 是 `11 01`。
+/// 完整 PICT 可能以 512 字节启动桩开头，因此偏移 0 与 512 都要检查。
+fn looks_like_pict(head: &[u8]) -> bool {
+    let at = |start: usize| {
+        // 需要至少 start+14 字节才能安全读取偏移 10..14 的特征码。
+        if head.len() < start + 14 {
+            return false;
+        }
+        &head[start + 10..start + 14] == [0x00, 0x11, 0x02, 0xFF]
+            || (head[start + 10] == 0x11 && head[start + 11] == 0x01)
+    };
+    at(0) || at(512)
+}
+
+/// XBM 文本特征：含 `#define` 且声明了 `_width`（或 `width`）尺寸宏。
+/// 仅作内容层面的兜底识别，真正校验在解码器里完成。
+fn looks_like_xbm(head: &[u8]) -> bool {
+    // 含 NUL 字节的大概率是二进制文件，直接排除。
+    if head.iter().take(512).any(|&b| b == 0) {
+        return false;
+    }
+    let text = String::from_utf8_lossy(&head[..head.len().min(512)]);
+    text.contains("#define") && (text.contains("_width") || text.contains("width"))
+}
+
+/// XPM 文本特征：标准 `/* XPM */` 注释，或 C 数组形式（`static ... char ... *[]`）。
+/// 仅作内容层面的兜底识别，真正校验在解码器里完成。
+fn looks_like_xpm(head: &[u8]) -> bool {
+    if head.iter().take(512).any(|&b| b == 0) {
+        return false;
+    }
+    let text = String::from_utf8_lossy(&head[..head.len().min(512)]);
+    if text.contains("XPM") {
+        let lowercase = text.to_ascii_lowercase();
+        // `/* XPM */` 是最稳的特征；退一步，C 数组形式也带 XPM 字样与 `char`/`*[]`。
+        return lowercase.contains("/* xpm */")
+            || (lowercase.contains("static") && lowercase.contains("char") && lowercase.contains("*["));
+    }
+    false
 }
 
 fn isobmff_brand(brand: &[u8]) -> Option<ImageFormat> {
@@ -259,6 +358,29 @@ mod tests {
         assert_eq!(sniff_magic(&[0x76, 0x2F, 0x31, 0x01, 0x02]), Some(ImageFormat::OpenExr));
         assert_eq!(sniff_magic(b"#?RADIANCE\n"), Some(ImageFormat::Hdr));
         assert_eq!(sniff_magic(&[0x00, 0x00, 0x01, 0x00, 0x01]), Some(ImageFormat::Ico));
+        // JPEG XR 的小端 / 大端签名。
+        assert_eq!(
+            sniff_magic(&[0x49, 0x49, 0xBC, 0x01, 0x20, 0x00]),
+            Some(ImageFormat::Jxr)
+        );
+        assert_eq!(
+            sniff_magic(&[0x4D, 0x4D, 0x00, 0xBC, 0x20, 0x00]),
+            Some(ImageFormat::Jxr)
+        );
+        // JPEG XR 的签名不得与 TIFF 的 `II\x2a\x00` 混淆。
+        assert_eq!(sniff_magic(b"II\x2a\x00\x08\x00\x00\x00"), Some(ImageFormat::Tiff));
+        // JPEG 2000 容器（JP2/JPX/MJ2）的 12 字节 `jP` box 签名。
+        assert_eq!(
+            sniff_magic(&[
+                0x00, 0x00, 0x00, 0x0C, 0x6A, 0x50, 0x20, 0x20, 0x0D, 0x0A, 0x87, 0x0A, 0x00, 0x00
+            ]),
+            Some(ImageFormat::Jp2)
+        );
+        // JPEG 2000 裸 codestream（`.j2k`）的 SOC+SIZ 标记。
+        assert_eq!(
+            sniff_magic(&[0xFF, 0x4F, 0xFF, 0x51, 0x00]),
+            Some(ImageFormat::Jp2)
+        );
     }
 
     #[test]
@@ -374,5 +496,39 @@ mod tests {
         assert_eq!(sniffed.format, None);
         assert_eq!(sniffed.source, SniffSource::None);
         assert!(!sniffed.is_mismatch());
+    }
+
+    #[test]
+    fn detects_new_formats_by_magic_or_text() {
+        // FLIF 魔数。
+        assert_eq!(sniff_magic(b"FLIF41\x02\x01"), Some(ImageFormat::Flif));
+        // MNG / JNG 的 8 字节签名。
+        assert_eq!(
+            sniff_magic(&[0x8A, b'M', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A]),
+            Some(ImageFormat::Mng)
+        );
+        assert_eq!(
+            sniff_magic(&[0x8B, b'J', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A]),
+            Some(ImageFormat::Jng)
+        );
+        // PICT 版本 2 特征（v1 与带 512 字节启动桩的变体也覆盖）。
+        assert_eq!(
+            sniff_magic(&[0u8; 10]), // 占位
+            None
+        );
+        let mut v2 = vec![0u8; 14];
+        v2[10..14].copy_from_slice(&[0x00, 0x11, 0x02, 0xFF]);
+        assert_eq!(sniff_magic(&v2), Some(ImageFormat::Pict));
+        let mut stubbed = vec![0u8; 512 + 14];
+        stubbed[522..526].copy_from_slice(&[0x00, 0x11, 0x02, 0xFF]);
+        assert_eq!(sniff_magic(&stubbed), Some(ImageFormat::Pict));
+        // XBM 文本特征。
+        let xbm = b"#define pic_width 8\n#define pic_height 8\nstatic unsigned char pic_bits[] = { 0x00 };";
+        assert_eq!(sniff_magic(xbm), Some(ImageFormat::Xbm));
+        // XPM 文本特征。
+        let xpm = b"/* XPM */\nstatic char *pic[] = {\n\"8 8 2 1\",\n\"a c #FF0000\"\n};";
+        assert_eq!(sniff_magic(xpm), Some(ImageFormat::Xpm));
+        // 二进制内容不应被误判成 XBM/XPM。
+        assert_eq!(sniff_magic(&[0u8; 512]), None);
     }
 }

@@ -392,7 +392,9 @@ pub fn pick_open_path() -> Option<PathBuf> {
 const IMAGE_EXTENSIONS: &[&str] = &[
     "png", "jpg", "jpeg", "jpe", "gif", "webp", "bmp", "tif", "tiff", "ico", "svg", "tga", "dds",
     "qoi", "pnm", "ppm", "pgm", "pbm", "hdr", "exr", "jxl", "heic", "heif", "avif", "nef", "nrw",
-    "arw", "srf", "sr2", "cr2", "cr3", "dng", "orf", "rw2", "raf", "pef", "srw",
+    "arw", "srf", "sr2", "cr2", "cr3", "dng", "orf", "rw2", "raf", "pef", "srw", "jxr", "wdp",
+    "hdp", "cur", "icns", "psd", "psb", "jp2", "j2k", "jpx", "jpf", "jpc", "mj2", "flif", "pict",
+    "pct", "pic", "xbm", "xpm", "mng", "jng",
 ];
 
 /// 弹出「重命名」对话框（本质是选一个新路径）。同样不能阻塞调用方线程。

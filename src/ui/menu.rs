@@ -33,10 +33,13 @@ use crate::ui::view::ImageViewerView;
 /// 标题栏。
 ///
 /// 从左到右：让位（macOS）+ 应用标记 + 菜单标签 + 可拖拽的标题区 + 窗口按钮。
-/// `open` 是当前展开的菜单下标，用来高亮对应标签。
+/// `open` 是当前展开的菜单下标，用来高亮对应标签。`show_menu` 为 false 时
+/// （正在看图）只保留拖拽区与窗口按钮，菜单标签与文件名文字整段跳过 ——
+/// 让图像占满标题栏那一行，同时窗口仍然能移动与关闭。
 pub fn title_bar(
     document: Option<&ImageDocument>,
     open: Option<usize>,
+    show_menu: bool,
     view: &Entity<ImageViewerView>,
     window: &Window,
 ) -> impl IntoElement {
@@ -49,8 +52,12 @@ pub fn title_bar(
     for placeholder in leading_placeholders(true) {
         leading = leading.child(placeholder);
     }
-    for (index, menu) in MENUS.iter().enumerate() {
-        leading = leading.child(menu_label(menu.label, index, open, view));
+    // 看图模式下不画菜单：这一行只留拖拽区与窗口按钮，菜单标签整段跳过。
+    // 没有菜单标签，下拉浮层也就无从展开。
+    if show_menu {
+        for (index, menu) in MENUS.iter().enumerate() {
+            leading = leading.child(menu_label(menu.label, index, open, view));
+        }
     }
 
     // 标题区：既是「现在在看什么」的显示位，也是窗口的拖拽区。
@@ -58,6 +65,8 @@ pub fn title_bar(
     // 这里声明成 Drag 而不是自己监听鼠标事件并调 `start_window_move()`：
     // 声明之后系统按 HTCAPTION 处理，拖拽、双击最大化、右键系统菜单一次全部到位。
     // 代价是这一块区域拿不到客户端的鼠标事件 —— 而它本来也不该有别的行为。
+    //
+    // 看图模式下不显示文件名文字，只留一个空的拖拽区，避免标题栏抢图像的注意力。
     let middle = div()
         .flex_1()
         .flex()
@@ -66,13 +75,17 @@ pub fn title_bar(
         .justify_center()
         .h_full()
         .overflow_hidden()
-        .window_control_area(WindowControlArea::Drag)
-        .child(
+        .window_control_area(WindowControlArea::Drag);
+    let middle = if show_menu {
+        middle.child(
             div()
                 .text_size(px(12.0))
                 .text_color(theme::text_muted())
                 .child(title_text(document)),
-        );
+        )
+    } else {
+        middle
+    };
 
     let mut bar = div()
         .flex()

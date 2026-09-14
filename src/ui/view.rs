@@ -180,8 +180,16 @@ impl ImageViewerView {
             Ok(document) => {
                 match Surface::build(&document) {
                     Ok(surface) => {
+                        // 打开图片的起点是 **1:1 原尺寸**，不是「适应窗口」（产品选择）。
+                        // 想铺满视口点「适应窗口」或双击即可。
+                        //
+                        // 这里可能还没测到画布尺寸（冷启动时打开早于首帧绘制，`last_viewport`
+                        // 仍是 0×0）：`actual_size` 会把倍率与模式定死，平移约束等拿到真实
+                        // 视口后由 `apply_viewport_change` 补一次 —— 注意 Actual 模式下它只夹
+                        // 平移量、不改倍率，所以 1:1 不会因为窗口尺寸变化而漂移。
                         self.transform = ViewTransform::default();
-                        self.transform.fit(document.logical_size(), self.last_viewport);
+                        self.transform
+                            .actual_size(1.0, document.logical_size(), self.last_viewport);
                         self.document = Some(document);
                         self.surface = Some(Arc::new(surface));
                         self.phase = Phase::Ready;
@@ -191,7 +199,8 @@ impl ImageViewerView {
                         trace::step(
                             "view",
                             format!(
-                                "进入 Ready：初始倍率={:.4} 平移=({:.2},{:.2}) 画布={:.2}×{:.2}（画布为 0 时下一帧会重算适应窗口）",
+                                "进入 Ready：模式={:?} 初始倍率={:.4} 平移=({:.2},{:.2}) 画布={:.2}×{:.2}（打开即 1:1；画布为 0 时下一帧只夹平移、不改倍率）",
+                                self.transform.mode(),
                                 self.transform.scale(),
                                 self.transform.pan().x,
                                 self.transform.pan().y,
@@ -694,14 +703,53 @@ impl ImageViewerView {
         self.open_path(path, cx);
     }
 
-    /// 占位层：加载中、失败与空状态都走这里。
-    fn placeholder(&self, window: &Window) -> AnyElement {
+    /// 占位层：空状态给一个居中的「打开图片」按钮；加载中与失败态给文字说明。
+    fn placeholder(&self, window: &Window, view: &Entity<ImageViewerView>) -> AnyElement {
+        // 空状态：画布正中一个「打开图片」按钮，点开系统文件对话框。
+        // 按钮下方留一行极弱的提示，告诉用户还有拖入与命令行两种入口；
+        // 但主操作只有一个，避免空界面上堆一堆文字。
+        if matches!(self.phase, Phase::Empty) {
+            let view = view.clone();
+            return div()
+                .flex()
+                .flex_col()
+                .items_center()
+                .justify_center()
+                .gap_3()
+                .absolute()
+                .inset_0()
+                .child(
+                    div()
+                        .px_6()
+                        .py_3()
+                        .rounded_lg()
+                        .bg(theme::primary())
+                        .text_color(theme::text())
+                        .text_size(px(15.0))
+                        .font_weight(FontWeight::MEDIUM)
+                        .cursor_pointer()
+                        .hover(|style| style.bg(theme::primary_hover()))
+                        .on_mouse_down(MouseButton::Left, move |_, _, cx| {
+                            // 走与菜单里「打开…」完全相同的路径（系统对话框在独立线程弹）。
+                            view.update(cx, |this, cx| this.open_dialog(cx));
+                        })
+                        .child("打开图片"),
+                )
+                .child(
+                    div()
+                        .text_color(theme::text_faint())
+                        .text_size(px(12.0))
+                        .child(format!(
+                            "也可以把图片拖进来，或执行 {} <图片路径>",
+                            env_program_name()
+                        )),
+                )
+                .into_any_element();
+        }
+
         let (headline, detail, accent) = match &self.phase {
-            Phase::Empty => (
-                "把图片拖进来，或从文件管理器双击一张图".to_string(),
-                format!("也可以执行 {} <图片路径>", env_program_name()),
-                theme::text_muted(),
-            ),
+            // 空状态已在上面单独处理，这里不会再走到。
+            Phase::Empty => return div().into_any_element(),
             Phase::Loading { name } => {
                 let elapsed = self
                     .task
@@ -782,14 +830,14 @@ impl ImageViewerView {
     }
 
     /// 画布区块：图像 + 占位层 + 浮层。
-    fn canvas_area(&mut self, window: &Window) -> AnyElement {
+    fn canvas_area(&mut self, window: &Window, view: &Entity<ImageViewerView>) -> AnyElement {
         let logical = self
             .document
             .as_ref()
             .map(|document| document.logical_size())
             .unwrap_or(ImageSize::ZERO);
 
-        let placeholder = self.placeholder(window);
+        let placeholder = self.placeholder(window, view);
         let toast = self.toast_layer();
 
         let mut area = div()
@@ -902,9 +950,21 @@ impl Render for ImageViewerView {
 
         // 先构建画布区（需要 `&mut self`），再构建其它区块（只读 `&self`）。
         // 顺序反过来的话，工具栏持有的不可变借用会与画布区的可变借用冲突。
-        let area = self.canvas_area(window);
+        let area = self.canvas_area(window, &view_handle);
 
-        let title_bar = menu::title_bar(self.document.as_ref(), self.menu, &view_handle, window);
+        // 有没有打开图片，决定界面「挤不挤」：
+        // - 打开图片（看图模式）→ 标题栏不画菜单、不画底部状态栏，把纵向空间让给图像；
+        //   窗口按钮仍保留在标题栏，所以窗口依旧能移动 / 最小化 / 关闭。
+        // - 没有图片 → 完整界面（菜单 + 状态栏），画布正中给一个「打开图片」按钮。
+        let has_image = self.document.is_some();
+
+        let title_bar = menu::title_bar(
+            self.document.as_ref(),
+            self.menu,
+            !has_image,
+            &view_handle,
+            window,
+        );
         let toolbar = panels::toolbar(
             self.document.as_ref(),
             zoom_percent,
@@ -913,9 +973,14 @@ impl Render for ImageViewerView {
             &view_handle,
         );
         let status = panels::status_bar(self.document.as_ref(), zoom_percent);
-        let menu_layer = menu::menu_layer(self.menu, self.document.is_some(), &view_handle);
+        // 看图模式下菜单已经不可见，下拉浮层无从展开，给一个空元素占位即可。
+        let menu_layer = if has_image {
+            div().into_any_element()
+        } else {
+            menu::menu_layer(self.menu, self.document.is_some(), &view_handle)
+        };
 
-        div()
+        let root = div()
             .flex()
             .flex_col()
             .size_full()
@@ -967,11 +1032,12 @@ impl Render for ImageViewerView {
                         cx.listener(|this, _event, _window, _cx| this.pan.end()),
                     )
                     .child(area),
-            )
-            .child(status)
-            // 下拉浮层必须是最后一个孩子：GPUI 按树序绘制，后画的盖住先画的。
-            // 放在标题栏里（它的逻辑归属处）会被后画的画布整块盖住。
-            .child(menu_layer)
+            );
+        // 看图模式下隐藏底部状态栏（菜单已在标题栏里整段跳过）。
+        let root = if has_image { root } else { root.child(status) };
+        // 下拉浮层必须是最后一个孩子：GPUI 按树序绘制，后画的盖住先画的。
+        // 放在标题栏里（它的逻辑归属处）会被后画的画布整块盖住。
+        root.child(menu_layer)
     }
 }
 

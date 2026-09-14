@@ -85,6 +85,18 @@ arboard = "3"
 # 另存为 / 重命名的原生文件对话框。
 # 注意它的对话框是**阻塞**的，必须在后台线程上弹，否则界面会冻住。
 rfd = "0.17"
+psd = "0.3.5"
+
+# FLIF（Free Lossless Image Format）：纯 Rust 解码器，返回 Result，不引入 C 依赖。
+flif = "0.4"
+# PICT（Apple QuickDraw picture）：纯 Rust 软栅格化解码器。关掉默认特性以不引入 oxideav-core 框架依赖，
+# 只暴露独立的 `parse_pict(&[u8]) -> Result<PictImage>`。
+oxideav-pict = { version = "0.0", default-features = false }
+
+# JPEG 2000（JP2 / J2K / JPX）：走 jpeg2k 的 C 后端 openjpeg-sys（工业级 OpenJPEG 库的绑定）。
+# 纯 Rust 后端 openjp2 在当前工具链下会在 codec 析构时触发 UB 崩溃，因此只用 C 后端（默认 feature 即是）。
+# 它跨平台，但依赖 C 编译器与 Windows SDK（构建环境需具备）。
+jpeg2k = "0.10.1"
 
 # HEIC/HEIF 与 AVIF：都走系统原生解码器（见 `src/decode/heic.rs` 与 `src/decode/avif.rs`）。
 #

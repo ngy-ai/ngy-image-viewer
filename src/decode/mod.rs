@@ -27,12 +27,22 @@
 //! 调用方（`open_job`、UI）一行都不用改。
 
 pub mod avif;
+pub mod cur;
 pub mod demosaic;
 pub mod dds;
 pub mod exif;
 pub mod heic;
+pub mod icns;
+pub mod jp2;
 pub mod jxl;
+pub mod flif;
+pub mod mng;
+pub mod pict;
+pub mod xbm;
+pub mod xpm;
+pub mod jxr;
 pub mod orientation;
+pub mod psd;
 pub mod raster;
 pub mod raw;
 pub mod sniff;
@@ -99,10 +109,28 @@ impl DecoderRegistry {
                 Box::new(raster::RasterDecoder),
                 Box::new(jxl::JxlDecoder),
                 Box::new(svg::SvgDecoder),
+                // 容器与 ICO 完全相同的 Windows 光标，以及内嵌 PNG 的 macOS 图标，
+                // 都走 `image` crate，与上面的栅格解码器同属一类。
+                Box::new(cur::CurDecoder),
+                Box::new(icns::IcnsDecoder),
+                // Photoshop 文档（含图层合并图的纯 Rust 解码），与上面同属纯计算路径。
+                // 注意 `self::psd` 指向本仓库的解码器模块——外部依赖 crate 也叫 `psd`，
+                // 裸写 `psd::` 会被解析成那个依赖 crate，这里必须用 `self::` 消歧。
+                Box::new(crate::decode::psd::PsdDecoder),
                 // 平台后端排在最后：它们的文件头分别与 ISOBMFF 容器、TIFF 共用，
                 // 而且都要依赖系统组件，只有前面都没认出来才轮到它们去尝试。
                 Box::new(avif::AvifDecoder),
                 Box::new(heic::HeicDecoder),
+                Box::new(jxr::JxrDecoder),
+                // JPEG 2000：走 jpeg2k 的 openjpeg-sys C 后端（跨平台），放在平台后端区末尾。
+                Box::new(jp2::Jp2Decoder),
+                // 纯计算、零 C 依赖的自写 / 纯 Rust 解码器：与上面同属纯计算路径。
+                Box::new(xbm::XbmDecoder),
+                Box::new(xpm::XpmDecoder),
+                Box::new(flif::FlifDecoder),
+                Box::new(pict::PictDecoder),
+                // MNG / JNG：Rust 生态无解码库，仅识别 + 给出可操作拒绝（见 mng.rs）。
+                Box::new(mng::MngDecoder),
                 Box::new(raw::RawDecoder),
                 // DDS 单独成解码器：Windows 走 WIC（覆盖 BC1–BC7），其余平台走 image crate。
                 Box::new(dds::DdsDecoder),
@@ -304,6 +332,17 @@ mod tests {
             ImageFormat::Raw,
             ImageFormat::Heic,
             ImageFormat::Avif,
+            ImageFormat::Jxr,
+            ImageFormat::Cur,
+            ImageFormat::Icns,
+            ImageFormat::Psd,
+            ImageFormat::Jp2,
+            ImageFormat::Xbm,
+            ImageFormat::Xpm,
+            ImageFormat::Flif,
+            ImageFormat::Pict,
+            ImageFormat::Mng,
+            ImageFormat::Jng,
         ] {
             assert!(
                 registry.decoder_for(format).is_some(),

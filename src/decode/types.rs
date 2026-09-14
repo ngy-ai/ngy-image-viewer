@@ -259,6 +259,31 @@ pub enum ImageFormat {
     Heic,
     /// 相机原片（CR2/NEF/ARW/ORF/RAF/DNG...）。
     Raw,
+    /// JPEG XR（又称 HD Photo，扩展名 `.jxr` `.wdp` `.hdp`）。
+    /// Windows 上由 WIC 原生解码，其它平台暂无后端。
+    Jxr,
+    /// Windows 光标文件（`.cur`），容器与 ICO 完全相同，仅类型字段不同。
+    Cur,
+    /// macOS 图标文件（`.icns`），容器内以 PNG（现代）或 JPEG 2000（旧）内嵌多尺寸图像。
+    Icns,
+    /// Photoshop 文档（`.psd` `.psb`）。走 `psd` crate 合成扁平化图层；
+    /// CMYK / 多通道等 crate 不支持的颜色模式会被显式拒绝而非静默降级。
+    Psd,
+    /// JPEG 2000 系列（`.jp2` `.j2k` `.jpx` `.jpf` `.jpc` `.mj2`）。
+    /// 走 jpeg2k 的 openjpeg-sys C 后端，跨平台（构建环境需具备 C 编译器与 Windows SDK）。
+    Jp2,
+    /// X BitMap（`.xbm`）：纯文本 C 数组，1 位单色，自写解析器展开为 RGBA8。
+    Xbm,
+    /// X PixMap（`.xpm`）：纯文本 C 数组，自写解析器，支持 1/2 字符/像素与透明度键。
+    Xpm,
+    /// FLIF（Free Lossless Image Format，`.flif`）：纯 Rust 解码器（仅 8 位、非动画、非隔行）。
+    Flif,
+    /// PICT（Apple QuickDraw picture，`.pict` `.pct` `.pic`）：纯 Rust 软栅格化解码器。
+    Pict,
+    /// MNG（多图像/动画容器，`.mng`）：Rust 生态无解码库，仅识别并给出可操作拒绝。
+    Mng,
+    /// JNG（JPEG 变体容器，`.jng`）：同 MNG，仅识别并给出可操作拒绝。
+    Jng,
 }
 
 impl ImageFormat {
@@ -284,6 +309,17 @@ impl ImageFormat {
             Self::Svg => "SVG",
             Self::Heic => "HEIC/HEIF",
             Self::Raw => "相机 RAW",
+            Self::Jxr => "JPEG XR",
+            Self::Cur => "CUR",
+            Self::Icns => "ICNS",
+            Self::Psd => "PSD",
+            Self::Jp2 => "JPEG 2000",
+            Self::Xbm => "XBM",
+            Self::Xpm => "XPM",
+            Self::Flif => "FLIF",
+            Self::Pict => "PICT",
+            Self::Mng => "MNG",
+            Self::Jng => "JNG",
         }
     }
 
@@ -309,6 +345,17 @@ impl ImageFormat {
             Self::Svg => "svg",
             Self::Heic => "heic",
             Self::Raw => "dng",
+            Self::Jxr => "jxr",
+            Self::Cur => "cur",
+            Self::Icns => "icns",
+            Self::Psd => "psd",
+            Self::Jp2 => "jp2",
+            Self::Xbm => "xbm",
+            Self::Xpm => "xpm",
+            Self::Flif => "flif",
+            Self::Pict => "pict",
+            Self::Mng => "mng",
+            Self::Jng => "jng",
         }
     }
 
@@ -372,6 +419,17 @@ impl ImageFormat {
             "jxl" => Self::Jxl,
             "svg" | "svgz" => Self::Svg,
             "heic" | "heif" | "hif" | "avci" | "avcs" => Self::Heic,
+            "jxr" | "wdp" | "hdp" => Self::Jxr,
+            "cur" => Self::Cur,
+            "icns" => Self::Icns,
+            "psd" | "psb" => Self::Psd,
+            "jp2" | "j2k" | "jpx" | "jpf" | "jpc" | "mj2" => Self::Jp2,
+            "xbm" => Self::Xbm,
+            "xpm" => Self::Xpm,
+            "flif" => Self::Flif,
+            "pict" | "pct" | "pic" => Self::Pict,
+            "mng" => Self::Mng,
+            "jng" => Self::Jng,
             "cr2" | "cr3" | "crw" | "nef" | "nrw" | "arw" | "sr2" | "srf" | "orf" | "raf"
             | "rw2" | "raw" | "dng" | "pef" | "ptx" | "rwl" | "rwz" | "x3f" | "3fr" | "fff"
             | "iiq" | "mos" | "mrw" | "srw" | "erf" | "mef" | "kap" | "dcr" | "k25" | "kdc"

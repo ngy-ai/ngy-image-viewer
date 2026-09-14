@@ -57,13 +57,13 @@ pub struct WicRequest<'a> {
 }
 
 /// COM 单元守卫。
-struct ComApartment {
+pub(crate) struct ComApartment {
     /// 只有「本次调用确实从零初始化了 COM」时才由我们负责反初始化。
     owns_initialization: bool,
 }
 
 impl ComApartment {
-    fn enter() -> Self {
+    pub(crate) fn enter() -> Self {
         // SAFETY: `CoInitializeEx` 只改动当前线程的 COM 单元状态，没有跨线程副作用；
         // 下面通过 `Drop` 与它严格配对。
         let result = unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) };
@@ -85,6 +85,7 @@ impl Drop for ComApartment {
         }
     }
 }
+
 
 pub fn decode(src: &Path, limits: &DecodeLimits, request: WicRequest<'_>) -> DecodeResult<ImageData> {
     let _apartment = ComApartment::enter();
@@ -188,7 +189,7 @@ pub fn decode(src: &Path, limits: &DecodeLimits, request: WicRequest<'_>) -> Dec
 /// 分类的依据是「用户的下一步该做什么」：
 /// 装组件、换文件，还是别的 —— 三类提示必须分开，
 /// 混淆会让用户白折腾一圈。
-fn classify(src: &Path, request: &WicRequest<'_>, error: WinError) -> DecodeError {
+pub(crate) fn classify(src: &Path, request: &WicRequest<'_>, error: WinError) -> DecodeError {
     let code = error.code().0;
 
     // 系统里没有能处理这种编码的组件。
