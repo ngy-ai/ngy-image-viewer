@@ -247,6 +247,22 @@ fn initial_view_falls_back_to_1_to_1_when_the_canvas_is_unmeasured() {
 }
 
 #[test]
+fn pending_is_a_gap_not_a_zoom_mode() {
+    // 「待定」是刚打开图片、还没量到画布尺寸的那段空档，不是一个缩放模式：
+    // 它必须原样保持到 `initial` 把它定成适应或 1:1。若在这里被当成普通状态处理
+    // （顺手夹一下平移、按视口重算倍率），第一帧的画面就会与最终结果对不上 ——
+    // 而绘制层是照 `initial` 就地求值的，两者一旦分叉就会看到一次跳变。
+    let image = Size::new(4000.0, 3000.0);
+
+    let mut transform = ViewTransform::pending();
+    assert_eq!(transform.mode(), ZoomMode::Pending);
+
+    transform.apply_viewport_change(image, Size::new(1536.0, 1018.0));
+    assert_eq!(transform.mode(), ZoomMode::Pending);
+    assert_eq!(transform.pan(), Vec2::ZERO);
+}
+
+#[test]
 fn zoom_percent_is_relative_to_the_device_pixel_ratio() {
     let image = Size::new(100.0, 100.0);
     let viewport = Size::new(100.0, 100.0);

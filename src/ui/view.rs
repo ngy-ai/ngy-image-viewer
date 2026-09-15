@@ -264,15 +264,14 @@ impl ImageViewerView {
             Ok(document) => {
                 match Surface::build(&document) {
                     Ok(surface) => {
-                        // 打开图片的起点是「1:1 优先，装不下就适应窗口」，
-                        // 最终由 `apply_initial_view` 拿真实画布尺寸判定（见
-                        // `ViewTransform::initial`）。这里先按 1:1 摆好：冷启动时
-                        // 打开结果早于首帧绘制，`last_viewport` 还是 0×0，此刻无从
-                        // 判断装不装得下，只能先定住倍率与模式，免得中间某一帧看到
-                        // 一个空变换；真实尺寸一到，下一帧就重算（通常就在同一帧内）。
-                        self.transform = ViewTransform::default();
-                        self.transform
-                            .actual_size(1.0, document.logical_size(), self.last_viewport);
+                        // 打开图片的起点是「1:1 优先，装不下就适应窗口」，判据见
+                        // `ViewTransform::initial`。这里先挂一个「还没定」的占位：
+                        // 选哪种要看画布尺寸与屏幕缩放，而此刻 `last_viewport` 还是
+                        // 0×0（冷启动时打开早于首帧绘制），屏幕缩放更是只有窗口知道。
+                        // 占位期间由绘制层就地求值（同一个 `initial`），所以画面从
+                        // 第一帧起就是最终的样子；视图层量到画布尺寸后
+                        // （`apply_initial_view`）再把状态定下来。
+                        self.transform = ViewTransform::pending();
                         self.initial_view_pending = true;
                         // 邻居列表与首帧并行：目录枚举在自己的线程上跑，
                         // 这里只是派发，不等待 —— 首帧时刻一分都不让。
@@ -295,7 +294,7 @@ impl ImageViewerView {
                         trace::step(
                             "view",
                             format!(
-                                "进入 Ready：模式={:?} 初始倍率={:.4} 平移=({:.2},{:.2}) 画布={:.2}×{:.2}（先按 1:1 保底，初始视图待定={}；装不下会改成适应窗口）",
+                                "进入 Ready：模式={:?} 初始倍率={:.4} 平移=({:.2},{:.2}) 画布={:.2}×{:.2}（初始视图待定={}，待定期间由绘制层就地求值）",
                                 self.transform.mode(),
                                 self.transform.scale(),
                                 self.transform.pan().x,
@@ -338,9 +337,12 @@ impl ImageViewerView {
     /// 为刚打开的那张图定下初始视图。
     ///
     /// 只在「打开了新图、但画布尺寸还没测到」时起作用：冷启动时打开结果早于首帧绘制，
-    /// `last_viewport` 还是 0×0，`ViewTransform::initial` 无从判断装不装得下，只能先
-    /// 退回 1:1。这里补上真实尺寸后的那次判定 —— 判定口径与「适应窗口」一致都是
-    /// 逻辑点，高分屏下的换算由 `ViewTransform::initial` 内部的倍率比较承担。
+    /// `last_viewport` 还是 0×0，`ViewTransform::initial` 无从判断装不装得下，只能先挂
+    /// 一个 [`ZoomMode::Pending`] 占位。这里补上画布尺寸与屏幕缩放后的那次判定。
+    ///
+    /// 判定函数与绘制层就地求值用的是同一个 `initial`，所以画面不会因为这次判定而变 ——
+    /// 它只是把「待定」这个状态落定，好让缩放读数、工具栏高亮这些读 `scale()` 的地方
+    /// 拿到真实值。
     fn apply_initial_view(&mut self, window: &Window) {
         if !self.initial_view_pending {
             return;
@@ -780,10 +782,8 @@ impl ImageViewerView {
         // 非阻塞：把目标路径的获取交给后台线程，结果由 `pump_dialog` 收。
         // 必须记住「被改名的源文件」是谁，否则对话框关闭时再去动一个
         // 可能已经不存在的老路径。
-        self.pending_dialog = Some(PendingDialog::Rename {
-            current,
-            rx: file_ops::pick_rename_path(&current),
-        });
+        let rx = file_ops::pick_rename_path(&current);
+        self.pending_dialog = Some(PendingDialog::Rename { current, rx });
         cx.notify();
     }
 
@@ -915,6 +915,10 @@ impl ImageViewerView {
             || self.pending_dialog.is_some()
             // 刚按过 F11 / ESC：等平台的全屏标志翻面（见 `FULLSCREEN_SETTLE_FRAMES`）。
             || self.fullscreen_pending > 0
+            // 初始视图还没定：要等到下一帧才有画布尺寸可用（见 `apply_initial_view`）。
+            // 少这一项时画面本身还是对的（绘制层就地求值），但缩放读数与工具栏高亮
+            // 会一直停在占位的「待定」上 —— 这类"界面不跟着动"最难从现象倒推。
+            || self.initial_view_pending
     }
 
     // ---- 全屏 ----

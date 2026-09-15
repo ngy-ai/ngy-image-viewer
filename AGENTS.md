@@ -150,6 +150,10 @@ impl Display { /* 走 short_reason */ }
 | WIC：`CopyPixels` 的目标格式用 `GUID_WICPixelFormat32bppBGRA` | 所有 WIC 编解码器都必须支持它；`32bppRGBA` 不一定 |
 | `flex_1()` **只在 flex 容器里生效** | 排版树的中间层若忘了 `.flex()`，子元素的 `flex_1()` 会静默失效、高度塌成 0。画布是绝对定位的，不占空间，于是整块画布变成「宽 × 0」——而 `paint_image` 在可见区域为空时返回 `Ok(())`，**不报任何错**，表现为「界面全黑、控制台寂静」。改 `ui/view.rs` 的窗口骨架时，每一层都要问一句「这层有没有声明 flex 容器」 |
 | `paint_image` 在可见区域为空时返回 `Ok(())` | 不能用返回值判断「有没有画出来」。需要判定时自己算 `bounds.intersect(&image_bounds)`（见 `render/viewport.rs`） |
+| `Window::is_fullscreen()` 是只读查询；切换只有 `toggle_fullscreen()`，没有 set 版本 | 界面是否隐藏必须**每帧读平台值**，不要在切换的那一刻自己翻一个布尔：Windows 的 `toggle_fullscreen` 走 `executor.spawn` 异步投递（`gpui-pre-windows`），自持的那份会先于平台生效，随后两者打架 —— 界面「先藏起来再亮回来」 |
+| `gpui_kit::*` 在 `test-support` 下含 GPUI 自己的 `test` 宏 | 测试模块里写 `use super::*` 会遮蔽内置 `#[test]`，报的是 `recursion limit reached while expanding \`#[test]\``，看不出根因（`gpui-kit` 的 lib.rs 里对此有明确说明）。测试模块按需显式导入，别 glob |
+| `window.request_animation_frame()` 只请求**下一帧** | 任何「等平台状态翻面再重绘」的逻辑（如全屏切换）都必须自己跨若干帧重复请求，只请求一次会停在旧样子上，直到用户碰一下鼠标才变 |
+| 绘制闭包能拿到 `window.scale_factor()` 与画布真实尺寸，`new()` / `accept()` 两样都拿不到 | 「打开图片时的初始缩放」这类要同时看两者才能定的状态，让绘制层**就地求值**（`ViewTransform::fitted` / `initial`）就够，不必等视图下一帧 —— 但两处必须调用**同一个纯函数**，各写一份的结果是第一帧与落定后的画面不一致，表现为一次莫名其妙的跳变。`ZoomMode::Pending` 就是为这段空档存在的：它不是缩放模式，而是「还没定」 |
 
 ### WIC 的两个运行时约束
 

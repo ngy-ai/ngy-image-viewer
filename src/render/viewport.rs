@@ -123,13 +123,22 @@ pub fn viewport(config: ViewportConfig) -> impl IntoElement {
         move |bounds, _state, window, _cx| {
             let viewport = Size::new(to_f32(bounds.size.width), to_f32(bounds.size.height));
 
-            // 在「适应窗口」模式下就地求值：绘制闭包拿不到 `&mut self`，
-            // 但把纯函数 `fitted` 在这里算一遍，就能让**第一帧**也落在正确位置，
-            // 不必等视图下一帧把尺寸回传上来才发现适应还没生效。
-            let effective = if transform.mode() == ZoomMode::Fit {
-                ViewTransform::fitted(logical_size, viewport)
-            } else {
-                transform
+            // 两种模式在这里就地求值：绘制闭包拿不到 `&mut self`，但把纯函数算一遍，
+            // 就能让**第一帧**也落在正确位置，不必等视图下一帧把尺寸回传上来。
+            //
+            // - `Fit`：适应窗口跟着画布尺寸走，每帧按当前画布算一次；
+            // - `Pending`：刚打开、初始视图还没定（见 `ZoomMode::Pending`）。画布尺寸
+            //   与屏幕缩放只有在这里才同时可得 —— 就地算出与视图层**同一个**结果，
+            //   第一帧就是最终画面，不会「先按甲模式画一帧、下一帧跳成乙模式」。
+            let effective = match transform.mode() {
+                ZoomMode::Fit => ViewTransform::fitted(logical_size, viewport),
+                ZoomMode::Pending => ViewTransform::initial(
+                    // 与 `ui/view.rs` 的 `pixel_ratio_of` 同义（窗口的 DPR）。
+                    f32::from(window.scale_factor()),
+                    logical_size,
+                    viewport,
+                ),
+                ZoomMode::Actual | ZoomMode::Free => transform,
             };
 
             window.paint_quad(fill(bounds, background));
