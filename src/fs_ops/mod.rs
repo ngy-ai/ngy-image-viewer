@@ -34,8 +34,10 @@
 
 pub mod file_ops;
 pub mod neighbors;
+pub mod settings;
 
 pub use neighbors::{Neighbors, NeighborsTask};
+pub use settings::Preference;
 pub use file_ops::{
     Bitmap, FileOpError, copy_to_clipboard, delete_to_trash, pick_rename_path, pick_save_path,
     rename, save_bitmap, suggest_save_name, writable_format_for,

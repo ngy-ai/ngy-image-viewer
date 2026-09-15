@@ -26,8 +26,9 @@
 use gpui_kit::*;
 
 use crate::model::ImageDocument;
+use crate::fs_ops::Preference;
 use crate::ui::command::{self, Command, Entry, MENUS};
-use crate::ui::theme;
+use crate::ui::theme::{self, Skin};
 use crate::ui::view::ImageViewerView;
 
 /// 标题栏。
@@ -37,6 +38,7 @@ use crate::ui::view::ImageViewerView;
 /// （正在看图）只保留拖拽区与窗口按钮，菜单标签与文件名文字整段跳过 ——
 /// 让图像占满标题栏那一行，同时窗口仍然能移动与关闭。
 pub fn title_bar(
+    skin: &Skin,
     document: Option<&ImageDocument>,
     open: Option<usize>,
     show_menu: bool,
@@ -49,14 +51,14 @@ pub fn title_bar(
         .items_center()
         .h_full()
         .flex_shrink_0();
-    for placeholder in leading_placeholders(true) {
+    for placeholder in leading_placeholders(skin, true) {
         leading = leading.child(placeholder);
     }
     // 看图模式下不画菜单：这一行只留拖拽区与窗口按钮，菜单标签整段跳过。
     // 没有菜单标签，下拉浮层也就无从展开。
     if show_menu {
         for (index, menu) in MENUS.iter().enumerate() {
-            leading = leading.child(menu_label(menu.label, index, open, view));
+            leading = leading.child(menu_label(skin, menu.label, index, open, view));
         }
     }
 
@@ -80,7 +82,7 @@ pub fn title_bar(
         middle.child(
             div()
                 .text_size(px(12.0))
-                .text_color(theme::text_muted())
+                .text_color(skin.text_muted)
                 .child(title_text(document)),
         )
     } else {
@@ -95,14 +97,14 @@ pub fn title_bar(
         .h(px(theme::TITLE_BAR_HEIGHT))
         .flex_shrink_0()
         .pl(px(theme::TITLE_BAR_PADDING))
-        .bg(theme::surface())
+        .bg(skin.surface)
         .border_b_1()
-        .border_color(theme::border())
+        .border_color(skin.border)
         .child(leading)
         .child(middle);
 
     if draws_window_buttons() {
-        bar = bar.child(window_buttons(window));
+        bar = bar.child(window_buttons(skin, window));
     } else {
         // 不减掉右侧内边距会与 macOS 的红绿灯 / 窗口管理器绘制的按钮贴在一起。
         bar = bar.pr(px(theme::TITLE_BAR_PADDING));
@@ -116,8 +118,10 @@ pub fn title_bar(
 /// 没有展开的菜单时返回一个空元素：浮层若常驻，它会持续占住命中区，
 /// 把画布与标题栏的鼠标事件全部吃掉。
 pub fn menu_layer(
+    skin: &Skin,
     open: Option<usize>,
     has_image: bool,
+    preference: Preference,
     view: &Entity<ImageViewerView>,
 ) -> AnyElement {
     let Some(index) = open else {
@@ -129,7 +133,7 @@ pub fn menu_layer(
 
     // 与标题栏等宽的占位：让位（macOS）+ 应用标记（这里只要宽度）+ 前面的菜单标签。
     let mut leading = div().flex().flex_row().items_center().flex_shrink_0();
-    for placeholder in leading_placeholders(false) {
+    for placeholder in leading_placeholders(skin, false) {
         leading = leading.child(placeholder);
     }
     for _ in 0..index {
@@ -146,9 +150,9 @@ pub fn menu_layer(
         .w(px(theme::MENU_PANEL_WIDTH))
         .py(px(4.0))
         .rounded_md()
-        .bg(theme::surface_active())
+        .bg(skin.surface_active)
         .border_1()
-        .border_color(theme::border())
+        .border_color(skin.border)
         // 面板压在画布上，而画布可能是任何颜色。加一层投影把它与图像分开，
         // 否则在浅色照片上这条边界会糊掉（近黑的描边在深色照片上又几乎看不见）。
         .shadow_lg();
@@ -159,9 +163,9 @@ pub fn menu_layer(
                 .h(px(1.0))
                 .my(px(4.0))
                 .mx_2()
-                .bg(theme::border())
+                .bg(skin.border)
                 .into_any_element(),
-            Entry::Item(command) => menu_item(*command, has_image, view),
+            Entry::Item(command) => menu_item(skin, *command, has_image, preference, view),
         });
     }
 
@@ -189,8 +193,18 @@ pub fn menu_layer(
 }
 
 /// 一个菜单项。
-fn menu_item(command: Command, has_image: bool, view: &Entity<ImageViewerView>) -> AnyElement {
+fn menu_item(
+    skin: &Skin,
+    command: Command,
+    has_image: bool,
+    preference: Preference,
+    view: &Entity<ImageViewerView>,
+) -> AnyElement {
     let enabled = !command.needs_image() || has_image;
+    // 皮肤三项是互斥的单选，当前生效的那个要有个「已选中」的标记。
+    // 用文字标记而不是一个勾号字形：那些码位不保证在系统字体里存在，
+    // 缺字时用户看到的是豆腐块（与 `maximize_glyph` 同一个理由）。
+    let marked = command.is_selected_skin(preference);
 
     let mut row = div()
         .flex()
@@ -201,17 +215,37 @@ fn menu_item(command: Command, has_image: bool, view: &Entity<ImageViewerView>) 
         .h(px(theme::MENU_ITEM_HEIGHT))
         .px_3()
         .text_size(px(12.0))
-        .text_color(if enabled {
-            theme::text()
+        .text_color(if marked {
+            skin.primary
+        } else if enabled {
+            skin.text
         } else {
-            theme::text_faint()
+            skin.text_faint
         })
-        .child(div().flex_shrink_0().child(command.label()))
+        .child(
+            div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap_2()
+                .flex_shrink_0()
+                // 固定的标记位：有无勾号都由它占位，这样三项的文字左边缘对齐，
+                // 不会因为「当前选中的那个多了个字」而整列挪一下。
+                .child(
+                    div()
+                        .w(px(10.0))
+                        .flex_shrink_0()
+                        .text_size(px(10.0))
+                        .text_color(skin.primary)
+                        .child(if marked { "●" } else { "" }),
+                )
+                .child(command.label()),
+        )
         .child(
             div()
                 .flex_shrink_0()
                 .text_size(px(11.0))
-                .text_color(theme::text_faint())
+                .text_color(skin.text_faint)
                 .child(command.shortcut_label()),
         );
 
@@ -219,7 +253,7 @@ fn menu_item(command: Command, has_image: bool, view: &Entity<ImageViewerView>) 
         // 禁用项不挂任何监听：既不会有悬停反馈，也点不动，与它的灰色外观一致。
         row = row
             .cursor_pointer()
-            .hover(|style| style.bg(theme::surface_hover()))
+            .hover(|style| style.bg(skin.surface_hover))
             .on_mouse_down(MouseButton::Left, {
                 let view = view.clone();
                 move |_event, window, cx| {
@@ -238,6 +272,7 @@ fn menu_item(command: Command, has_image: bool, view: &Entity<ImageViewerView>) 
 /// 横向分组，百分比高度在"父级高度由内容决定"的链条上会退化成内容高度，
 /// 表现是「当前菜单的背景色只包住两个字」，而不是铺满整条标题栏。
 fn menu_label(
+    skin: &Skin,
     label: &'static str,
     index: usize,
     open: Option<usize>,
@@ -254,9 +289,9 @@ fn menu_label(
         .flex_shrink_0()
         .text_size(px(12.0))
         .text_color(if active {
-            theme::text()
+            skin.text
         } else {
-            theme::text_muted()
+            skin.text_muted
         })
         .child(label)
         .on_mouse_down(MouseButton::Left, {
@@ -267,9 +302,9 @@ fn menu_label(
         });
 
     if active {
-        element = element.bg(theme::surface_active());
+        element = element.bg(skin.surface_active);
     } else {
-        element = element.hover(|style| style.bg(theme::surface_hover()));
+        element = element.hover(|style| style.bg(skin.surface_hover));
     }
 
     // 只有已经有菜单展开时才监听悬停：没有展开时划过标签不该有任何副作用，
@@ -287,7 +322,7 @@ fn menu_label(
 }
 
 /// 标题栏右侧的三个窗口按钮。
-fn window_buttons(window: &Window) -> impl IntoElement {
+fn window_buttons(skin: &Skin, window: &Window) -> impl IntoElement {
     let maximized = window.is_maximized();
 
     div()
@@ -297,25 +332,28 @@ fn window_buttons(window: &Window) -> impl IntoElement {
         .h(px(theme::TITLE_BAR_HEIGHT))
         .flex_shrink_0()
         .child(window_button(
+            skin,
             WindowControlArea::Min,
             false,
             div()
                 .w(px(9.0))
                 .h(px(1.0))
-                .bg(theme::text_muted())
+                .bg(skin.text_muted)
                 .into_any_element(),
         ))
         .child(window_button(
+            skin,
             WindowControlArea::Max,
             false,
-            maximize_glyph(maximized),
+            maximize_glyph(skin, maximized),
         ))
         .child(window_button(
+            skin,
             WindowControlArea::Close,
             true,
             div()
                 .text_size(px(13.0))
-                .text_color(theme::text_muted())
+                .text_color(skin.text_muted)
                 .child("×")
                 .into_any_element(),
         ))
@@ -327,7 +365,12 @@ fn window_buttons(window: &Window) -> impl IntoElement {
 /// 处理（含最大化状态下的还原切换），我们连「当前是不是最大化」都不用自己维护。
 /// 无障碍语义同样来自系统 —— 这三个区域在平台上就是真正的窗口控件，
 /// 再补一个自绘标签只会和系统提供的那份重复。
-fn window_button(area: WindowControlArea, danger: bool, glyph: AnyElement) -> AnyElement {
+fn window_button(
+    skin: &Skin,
+    area: WindowControlArea,
+    danger: bool,
+    glyph: AnyElement,
+) -> AnyElement {
     div()
         .flex()
         .items_center()
@@ -340,9 +383,9 @@ fn window_button(area: WindowControlArea, danger: bool, glyph: AnyElement) -> An
         // 颜色是最省事的警告方式。
         .hover(move |style| {
             style.bg(if danger {
-                theme::danger()
+                skin.danger
             } else {
-                theme::surface_hover()
+                skin.surface_hover
             })
         })
         .child(glyph)
@@ -353,8 +396,8 @@ fn window_button(area: WindowControlArea, danger: bool, glyph: AnyElement) -> An
 ///
 /// 用两个方框画出来，而不是取 `❐` 这类字形：那些码位并不保证在系统字体里存在，
 /// 缺字时用户看到的是一个豆腐块，比图标不精确难看得多。
-fn maximize_glyph(maximized: bool) -> AnyElement {
-    let stroke = theme::text_muted();
+fn maximize_glyph(skin: &Skin, maximized: bool) -> AnyElement {
+    let stroke = skin.text_muted;
 
     if maximized {
         div()
@@ -382,7 +425,7 @@ fn maximize_glyph(maximized: bool) -> AnyElement {
                     .border_color(stroke)
                     // 用标题栏底色盖住下面那个方框被压住的一角，
                     // 于是看上去就是「两个错开的窗口」而不是一个田字。
-                    .bg(theme::surface()),
+                    .bg(skin.surface),
             )
             .into_any_element()
     } else {
@@ -399,7 +442,7 @@ fn maximize_glyph(maximized: bool) -> AnyElement {
 ///
 /// 标题栏用可见版本（`with_app_mark = true`），下拉浮层用等宽的隐形版本。
 /// 两处复用同一段构造，是浮层不需要任何像素换算就能对齐自己标签的原因。
-fn leading_placeholders(with_app_mark: bool) -> Vec<AnyElement> {
+fn leading_placeholders(skin: &Skin, with_app_mark: bool) -> Vec<AnyElement> {
     let mut items = Vec::new();
 
     if cfg!(target_os = "macos") {
@@ -413,7 +456,7 @@ fn leading_placeholders(with_app_mark: bool) -> Vec<AnyElement> {
     }
 
     if with_app_mark {
-        items.push(app_mark());
+        items.push(app_mark(skin));
     } else {
         items.push(
             div()
@@ -431,7 +474,7 @@ fn leading_placeholders(with_app_mark: bool) -> Vec<AnyElement> {
 /// 自绘标题栏之后，系统不再提供「这是哪个程序」的视觉线索（原来那个图标和名字在
 /// 系统标题栏上），这里用一个色块把它补回来 —— 窗口被拖到一堆窗口里时，
 /// 它是唯一能一眼认出本程序的东西。
-fn app_mark() -> AnyElement {
+fn app_mark(skin: &Skin) -> AnyElement {
     div()
         .flex()
         .items_center()
@@ -447,8 +490,8 @@ fn app_mark() -> AnyElement {
                 .w(px(18.0))
                 .h(px(18.0))
                 .rounded_sm()
-                .bg(theme::primary())
-                .text_color(theme::text())
+                .bg(skin.primary)
+                .text_color(skin.text)
                 .text_size(px(11.0))
                 .font_weight(FontWeight::SEMIBOLD)
                 .child("N"),

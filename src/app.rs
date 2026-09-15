@@ -171,11 +171,49 @@ pub fn run(options: AppOptions, mut task: Option<OpenTask>) -> anyhow::Result<()
             ),
         );
 
+        // 读一次用户偏好，在建窗**之前** —— 见 `window_options` 的说明。
+        //
+        // 这次读盘发生在关键路径上，所以它必须极快：一个几十字节的文本文件，
+        // 冷启动时在系统缓存里通常是微秒级。实测进不了打点噪声，
+        // 但它换来的是「用户选了深色，启动第一帧就是深色」——
+        // 否则窗口会先按系统配色显示一帧再跳，这是深浅色都做出来之后
+        // 最容易看见、也最像 bug 的一幕。
+        let preference = crate::fs_ops::settings::load();
+        // 让平台也切过去，**必须在建窗之前** —— `WindowOptions` 里没有外观字段
+        // （核实过 `platform.rs:1948` 起的字段清单），`set_window_appearance`
+        // 是唯一的通道。它作用在 app 级，之后创建的窗口就带着这个外观出生。
+        //
+        // 只有 macOS 真的实现了它（Windows 是空实现），但不调它的代价两边都有：
+        // 手动选了浅色的用户在深色系统上启动时，窗口会先按系统配色创建，
+        // 再被视图的自绘配色盖住 —— 表现为启动瞬间闪一下深色。
+        // 自绘部分本身从第一帧起就是对的（皮肤由偏好决定，见 `current_skin`），
+        // 这一调只影响平台绘制的那点外围（标题栏按钮、边框、滚动条）。
+        let platform_appearance = match preference {
+            crate::fs_ops::Preference::System => None,
+            crate::fs_ops::Preference::Fixed(polarity) => Some(match polarity {
+                crate::ui::theme::Polarity::Dark => WindowAppearance::Dark,
+                crate::ui::theme::Polarity::Light => WindowAppearance::Light,
+            }),
+        };
+        trace::step(
+            "app",
+            format!(
+                "皮肤偏好：{}",
+                match preference {
+                    crate::fs_ops::Preference::System => "跟随系统".to_string(),
+                    crate::fs_ops::Preference::Fixed(polarity) =>
+                        format!("固定{}", polarity.label()),
+                },
+            ),
+        );
+        cx.set_window_appearance(platform_appearance);
+
         let view = cx.new(|cx| {
             // 「启动就带图」= 文件管理器双击那条路径。它决定的是**界面形态**：
             // 带图启动时界面收起菜单与状态栏（详见 `ImageViewerView::immersive`），
             // 而通过菜单 / 按钮 / 拖入打开的图片不动界面形态。
             let mut view = ImageViewerView::new(cx, options.path.is_some());
+            view.set_loaded_preference(preference);
             match prefetched {
                 Some(outcome) => view.apply(outcome),
                 // 还没有结果：把任务交给视图，它会在每次渲染前轮询一次。

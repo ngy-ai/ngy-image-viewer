@@ -19,12 +19,12 @@ use gpui_kit::*;
 use crate::model::ImageDocument;
 use crate::ui::format::{bytes_text, duration_text, size_text, zoom_text};
 use crate::ui::icons;
-use crate::ui::theme;
+use crate::ui::theme::{self, Skin};
 use crate::ui::view::ImageViewerView;
 
 /// 面板与工具栏共用的区块分隔线。
-fn hairline() -> Hsla {
-    theme::border()
+fn hairline(skin: &Skin) -> Hsla {
+    skin.border
 }
 
 /// 顶部工具栏。
@@ -32,6 +32,7 @@ fn hairline() -> Hsla {
 /// 布局：左侧是文件名与格式角标，中部是缩放读数与适应/1:1 切换，
 /// 右侧是旋转、翻转、复制、另存为、重命名、删除与信息面板开关。
 pub fn toolbar(
+    skin: &Skin,
     document: Option<&ImageDocument>,
     zoom_percent: f32,
     fits: bool,
@@ -48,7 +49,7 @@ pub fn toolbar(
         div()
             .max_w(px(320.0))
             .overflow_hidden()
-            .text_color(theme::text())
+            .text_color(skin.text)
             .text_size(px(13.0))
             .font_weight(FontWeight::MEDIUM)
             .child(file_name),
@@ -60,8 +61,8 @@ pub fn toolbar(
                 .px_2()
                 .py(px(1.0))
                 .rounded_sm()
-                .bg(theme::surface_active())
-                .text_color(theme::text_muted())
+                .bg(skin.surface_active)
+                .text_color(skin.text_muted)
                 .text_size(px(10.0))
                 .child(format),
         );
@@ -78,11 +79,12 @@ pub fn toolbar(
             div()
                 .w(px(64.0))
                 .text_center()
-                .text_color(theme::text_muted())
+                .text_color(skin.text_muted)
                 .text_size(px(12.0))
                 .child(zoom_text(zoom_percent)),
         )
         .child(icon_button(
+            skin,
             icons::FIT,
             "适应窗口",
             fits,
@@ -93,6 +95,7 @@ pub fn toolbar(
             },
         ))
         .child(icon_button(
+            skin,
             icons::ACTUAL,
             "1:1",
             !fits,
@@ -106,39 +109,39 @@ pub fn toolbar(
     let mut right = div().flex().flex_row().items_center().gap_1();
 
     right = right
-        .child(icon_button(icons::ROTATE_CCW, "←90°", false, editable, {
+        .child(icon_button(skin, icons::ROTATE_CCW, "←90°", false, editable, {
             let view = view.clone();
             move |_, _, cx| update(&view, cx, |this, cx| this.rotate_counter_clockwise(cx))
         }))
-        .child(icon_button(icons::ROTATE_CW, "90°→", false, editable, {
+        .child(icon_button(skin, icons::ROTATE_CW, "90°→", false, editable, {
             let view = view.clone();
             move |_, _, cx| update(&view, cx, |this, cx| this.rotate_clockwise(cx))
         }))
-        .child(icon_button(icons::FLIP_H, "水平翻转", false, editable, {
+        .child(icon_button(skin, icons::FLIP_H, "水平翻转", false, editable, {
             let view = view.clone();
             move |_, _, cx| update(&view, cx, |this, cx| this.flip_horizontal(cx))
         }))
-        .child(icon_button(icons::FLIP_V, "垂直翻转", false, editable, {
+        .child(icon_button(skin, icons::FLIP_V, "垂直翻转", false, editable, {
             let view = view.clone();
             move |_, _, cx| update(&view, cx, |this, cx| this.flip_vertical(cx))
         }))
-        .child(icon_button(icons::COPY, "复制", false, editable, {
+        .child(icon_button(skin, icons::COPY, "复制", false, editable, {
             let view = view.clone();
             move |_, _, cx| update(&view, cx, |this, cx| this.copy_to_clipboard(cx))
         }))
-        .child(icon_button(icons::SAVE_AS, "另存为", false, editable, {
+        .child(icon_button(skin, icons::SAVE_AS, "另存为", false, editable, {
             let view = view.clone();
             move |_, _, cx| update(&view, cx, |this, cx| this.save_as(cx))
         }))
-        .child(icon_button(icons::RENAME, "重命名", false, editable, {
+        .child(icon_button(skin, icons::RENAME, "重命名", false, editable, {
             let view = view.clone();
             move |_, _, cx| update(&view, cx, |this, cx| this.rename(cx))
         }))
-        .child(icon_button(icons::TRASH, "删除", false, editable, {
+        .child(icon_button(skin, icons::TRASH, "删除", false, editable, {
             let view = view.clone();
             move |_, _, cx| update(&view, cx, |this, cx| this.delete_to_trash(cx))
         }))
-        .child(icon_button(icons::INFO, "EXIF", info_open, editable, {
+        .child(icon_button(skin, icons::INFO, "EXIF", info_open, editable, {
             let view = view.clone();
             move |_, _, cx| update(&view, cx, |this, cx| this.toggle_info_panel(cx))
         }));
@@ -152,9 +155,9 @@ pub fn toolbar(
         .w_full()
         .h(px(theme::TOOLBAR_HEIGHT))
         .px_3()
-        .bg(theme::surface())
+        .bg(skin.surface)
         .border_b_1()
-        .border_color(hairline())
+        .border_color(hairline(skin))
         .child(left)
         .child(middle)
         .child(right)
@@ -165,6 +168,7 @@ pub fn toolbar(
 /// `active` 表示「当前生效的模式」，用主色底提示；`enabled` 为假时降低不透明度
 /// 并且不响应点击 —— 没有打开的图片时，这些按钮点了也没有意义。
 fn icon_button<F>(
+    skin: &Skin,
     icon: &'static [u8],
     label: &'static str,
     active: bool,
@@ -175,18 +179,18 @@ where
     F: Fn(&MouseDownEvent, &mut Window, &mut App) + 'static,
 {
     let background = if !enabled {
-        theme::surface()
+        skin.surface
     } else if active {
-        theme::primary()
+        skin.primary
     } else {
-        theme::surface()
+        skin.surface
     };
     let foreground = if !enabled {
-        theme::text_faint()
+        skin.text_faint
     } else if active {
-        theme::text()
+        skin.text
     } else {
-        theme::text_muted()
+        skin.text_muted
     };
 
     // 图标以 currentColor 描边，由 text_color 着色，自动跟随三态；
@@ -211,7 +215,7 @@ where
         // 悬停高亮：只改底色，不动布局，避免鼠标划过时按钮"跳"一下。
         button = button
             .cursor_pointer()
-            .hover(move |style| style.bg(if active { theme::primary_hover() } else { theme::surface_hover() }))
+            .hover(move |style| style.bg(if active { skin.primary_hover } else { skin.surface_hover }))
             .on_mouse_down(MouseButton::Left, handler);
     }
 
@@ -225,7 +229,11 @@ where
 ///
 /// 提示语只留三条最常用的：状态栏是**唯一**常驻的说明位，而快捷键一多就没人看了
 /// （完整清单在「视图」菜单的快捷键提示里，那里按需展开）。
-pub fn status_bar(document: Option<&ImageDocument>, zoom_percent: f32) -> impl IntoElement {
+pub fn status_bar(
+    skin: &Skin,
+    document: Option<&ImageDocument>,
+    zoom_percent: f32,
+) -> impl IntoElement {
     let (size_text, format_text, bytes_text) = match document {
         Some(document) => {
             let size = document.logical_size();
@@ -250,11 +258,11 @@ pub fn status_bar(document: Option<&ImageDocument>, zoom_percent: f32) -> impl I
         .w_full()
         .h(px(theme::STATUS_BAR_HEIGHT))
         .px_3()
-        .bg(theme::surface())
+        .bg(skin.surface)
         .border_t_1()
-        .border_color(hairline())
+        .border_color(hairline(skin))
         .text_size(px(11.0))
-        .text_color(theme::text_faint())
+        .text_color(skin.text_faint)
         .child(
             div()
                 .flex()
@@ -287,16 +295,17 @@ const HINT: &str = "滚轮缩放 · 拖动平移 · 双击切换适应/1:1";
 ///
 /// 分四组展示。分组而不是平铺一串键值对，是因为用户找的是
 /// 「这张照片在哪拍的、用什么拍的」，而不是某个具体的 EXIF 标签号。
-pub fn info_panel(document: Option<&ImageDocument>) -> impl IntoElement {
+pub fn info_panel(skin: &Skin, document: Option<&ImageDocument>) -> impl IntoElement {
     let mut content = div().flex().flex_col().gap_4().p_4();
 
     match document {
         None => {
-            content = content.child(section_title("没有可显示的信息"));
+            content = content.child(section_title(skin, "没有可显示的信息"));
         }
         Some(document) => {
             let size = document.logical_size();
             content = content.child(section(
+                skin,
                 "文件",
                 vec![
                     ("文件名", document.file_name()),
@@ -311,6 +320,7 @@ pub fn info_panel(document: Option<&ImageDocument>) -> impl IntoElement {
 
             let exif = document.exif();
             content = content.child(section(
+                skin,
                 "相机与镜头",
                 vec![
                     (
@@ -330,6 +340,7 @@ pub fn info_panel(document: Option<&ImageDocument>) -> impl IntoElement {
             ));
 
             content = content.child(section(
+                skin,
                 "曝光参数",
                 vec![
                     (
@@ -355,6 +366,7 @@ pub fn info_panel(document: Option<&ImageDocument>) -> impl IntoElement {
             ));
 
             content = content.child(section(
+                skin,
                 "时间与方向",
                 vec![
                     (
@@ -386,15 +398,19 @@ pub fn info_panel(document: Option<&ImageDocument>) -> impl IntoElement {
         .flex_col()
         .w(px(theme::INFO_PANEL_WIDTH))
         .h_full()
-        .bg(theme::surface())
+        .bg(skin.surface)
         .border_l_1()
-        .border_color(hairline())
+        .border_color(hairline(skin))
         // 面板比画布更亮一点点，用半透明感把它与画布区分开，
         // 同时不产生一条生硬的边。
         .child(content)
 }
 
-fn section(title: &'static str, rows: Vec<(&'static str, String)>) -> impl IntoElement {
+fn section(
+    skin: &Skin,
+    title: &'static str,
+    rows: Vec<(&'static str, String)>,
+) -> impl IntoElement {
     let mut list = div().flex().flex_col().gap_2();
     for (key, value) in rows {
         list = list.child(
@@ -407,14 +423,14 @@ fn section(title: &'static str, rows: Vec<(&'static str, String)>) -> impl IntoE
                     div()
                         .w(px(72.0))
                         .flex_shrink_0()
-                        .text_color(theme::text_faint())
+                        .text_color(skin.text_faint)
                         .text_size(px(11.0))
                         .child(key),
                 )
                 .child(
                     div()
                         .flex_1()
-                        .text_color(theme::text_muted())
+                        .text_color(skin.text_muted)
                         .text_size(px(11.0))
                         .child(value),
                 ),
@@ -425,13 +441,13 @@ fn section(title: &'static str, rows: Vec<(&'static str, String)>) -> impl IntoE
         .flex()
         .flex_col()
         .gap_2()
-        .child(section_title(title))
+        .child(section_title(skin, title))
         .child(list)
 }
 
-fn section_title(title: &'static str) -> impl IntoElement {
+fn section_title(skin: &Skin, title: &'static str) -> impl IntoElement {
     div()
-        .text_color(theme::text())
+        .text_color(skin.text)
         .text_size(px(11.0))
         .font_weight(FontWeight::SEMIBOLD)
         .child(title)

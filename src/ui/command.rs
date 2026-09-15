@@ -44,6 +44,12 @@ pub enum Command {
     FlipVertical,
     ToggleInfoPanel,
     ToggleFullscreen,
+    /// 皮肤：跟随系统外观。
+    SkinFollowSystem,
+    /// 皮肤：固定深色。
+    SkinDark,
+    /// 皮肤：固定浅色。
+    SkinLight,
     Quit,
 }
 
@@ -68,17 +74,29 @@ impl Command {
             Self::FlipVertical => "垂直翻转",
             Self::ToggleInfoPanel => "EXIF 信息面板",
             Self::ToggleFullscreen => "全屏",
+            Self::SkinFollowSystem => "跟随系统",
+            Self::SkinDark => "深色",
+            Self::SkinLight => "浅色",
             Self::Quit => "退出",
         }
     }
 
     /// 没有打开图片时，这个动作是否还有意义。
     ///
-    /// 「打开」「全屏」「退出」不依赖当前文档；其余动作都作用在图像上，没有图的时候
+    /// 「打开」「全屏」「皮肤」「退出」不依赖当前文档；其余动作都作用在图像上，没有图的时候
     /// 点它们只会静默地什么都不发生 —— 那比显示成灰色更让人困惑，因此菜单里这些项
     /// 会被渲染成禁用态。键盘入口在视图里用同一个判断挡一次，两条入口不会走偏。
     pub fn needs_image(self) -> bool {
-        !matches!(self, Self::Open | Self::ToggleFullscreen | Self::Quit)
+        !matches!(
+            self,
+            // 皮肤是「窗口长什么样」，与画布内容无关：空状态下一样该能改。
+            Self::Open
+                | Self::ToggleFullscreen
+                | Self::SkinFollowSystem
+                | Self::SkinDark
+                | Self::SkinLight
+                | Self::Quit
+        )
     }
 
     /// 菜单右侧的快捷键提示；没有绑定按键时返回空串。
@@ -92,6 +110,26 @@ impl Command {
             }
             Some(binding) => binding.display.to_string(),
             None => String::new(),
+        }
+    }
+
+    /// 这个菜单项代表的皮肤选择，是否就是当前生效的那一个。
+    ///
+    /// 皮肤是**三选一**（跟随系统 / 深色 / 浅色），菜单需要把当前生效的那项标出来，
+    /// 否则用户点了「深色」之后无法确认到底生效了没有 —— 而深色与浅色的区别
+    /// 本身就够明显，反倒是「我到底是在跟随系统还是固定深色」看不出来。
+    ///
+    /// 非皮肤命令一律返回假：它们没有「选中」这个状态。
+    ///
+    /// 参数用 `crate::fs_ops::Preference` 而不是这里的类型 —— 偏好的**存储形态**
+    /// 归 `fs_ops` 管，本模块只回答「这一项是不是当前那项」。
+    pub fn is_selected_skin(self, preference: crate::fs_ops::Preference) -> bool {
+        use crate::fs_ops::Preference;
+        match self {
+            Self::SkinFollowSystem => preference == Preference::System,
+            Self::SkinDark => preference.matches(crate::ui::theme::Polarity::Dark),
+            Self::SkinLight => preference.matches(crate::ui::theme::Polarity::Light),
+            _ => false,
         }
     }
 }
@@ -158,6 +196,13 @@ pub const MENUS: &[Menu] = &[
             Entry::Item(Command::FlipVertical),
             Entry::Separator,
             Entry::Item(Command::ToggleInfoPanel),
+            Entry::Separator,
+            // 皮肤三项是一组互斥的单选：放在同一个分组里，与上面的命令动作分开。
+            // 「跟随系统」排第一，因为它是默认值 —— 用户进来第一眼要看到的是
+            // 「现在是什么状态」，而不是「我可以改成什么」。
+            Entry::Item(Command::SkinFollowSystem),
+            Entry::Item(Command::SkinDark),
+            Entry::Item(Command::SkinLight),
             Entry::Separator,
             Entry::Item(Command::ToggleFullscreen),
         ],
@@ -429,9 +474,13 @@ mod tests {
             );
         }
 
-        // 反向：所有动作里只有「重命名」「移到回收站」「退出」没有快捷键 ——
-        // 前两个要弹对话框 / 有破坏性，后者交给系统的 Alt+F4。
+        // 反向：所有动作里只有这些没有快捷键 —— 前两个要弹对话框 / 有破坏性，
+        // 「退出」交给系统的 Alt+F4，皮肤三项是低频的一次性设置
+        // （系统改了主题自己会跟随，不需要一个按键来切）。
         // 这条断言的作用是把「哪些动作没有快捷键」变成一个需要显式改动的决定。
+        //
+        // 顺序按**菜单里出现的先后**（`menu_commands` 逐菜单收集）：「退出」在
+        // 「文件」菜单末尾，所以排在「视图」菜单里的皮肤三项之前。
         let without_shortcut: Vec<Command> = menu_commands()
             .into_iter()
             .filter(|command| command.shortcut_label().is_empty())
@@ -441,20 +490,81 @@ mod tests {
             vec![
                 Command::Rename,
                 Command::DeleteToTrash,
-                Command::Quit
+                Command::Quit,
+                Command::SkinFollowSystem,
+                Command::SkinDark,
+                Command::SkinLight
             ]
         );
     }
 
     #[test]
     fn window_level_actions_do_not_require_an_open_image() {
-        // 这三分支是菜单禁用态的唯一依据，写错的表现是「没打开图片时连打开都点不动」。
+        // 这些分支是菜单禁用态的唯一依据，写错的表现是「没打开图片时连打开都点不动」，
+        // 或者反过来「空窗口下能点深色但点了没反应」。
         for command in menu_commands() {
             let expected = !matches!(
                 command,
-                Command::Open | Command::ToggleFullscreen | Command::Quit
+                Command::Open
+                    | Command::ToggleFullscreen
+                    | Command::SkinFollowSystem
+                    | Command::SkinDark
+                    | Command::SkinLight
+                    | Command::Quit
             );
             assert_eq!(command.needs_image(), expected, "{command:?}");
+        }
+    }
+
+    /// 皮肤三项正好覆盖三种偏好，且**每个偏好恰有一项被标为选中**。
+    ///
+    /// 这条断言防的是两类错：
+    /// - 新增了一个偏好变体却忘了加菜单项（用户无法切换到它）；
+    /// - `is_selected_skin` 的分支写漏或写重（菜单上出现两个 `●` 或一个都没有）。
+    ///   后者是「我到底在跟随系统还是固定深色」这个疑问的直接来源。
+    #[test]
+    fn the_three_skin_items_are_mutually_exclusive_and_cover_every_preference() {
+        use crate::fs_ops::Preference;
+        use crate::ui::theme::Polarity;
+
+        let skin_commands = [
+            Command::SkinFollowSystem,
+            Command::SkinDark,
+            Command::SkinLight,
+        ];
+
+        // 三个偏好各自恰好命中一项。
+        for preference in [
+            Preference::System,
+            Preference::Fixed(Polarity::Dark),
+            Preference::Fixed(Polarity::Light),
+        ] {
+            let marked: Vec<Command> = skin_commands
+                .into_iter()
+                .filter(|command| command.is_selected_skin(preference))
+                .collect();
+            assert_eq!(
+                marked.len(),
+                1,
+                "{preference:?} 应当恰好有一项被标为选中，实际是 {marked:?}"
+            );
+        }
+
+        // 非皮肤命令永远不参与选中态，否则菜单里会冒出莫名其妙的 `●`。
+        for command in menu_commands() {
+            if skin_commands.contains(&command) {
+                continue;
+            }
+            for preference in [
+                Preference::System,
+                Preference::Fixed(Polarity::Dark),
+                Preference::Fixed(Polarity::Light),
+            ] {
+                assert!(
+                    !command.is_selected_skin(preference),
+                    "{command:?} 不是皮肤项，不该被标为选中"
+                );
+            }
         }
     }
 

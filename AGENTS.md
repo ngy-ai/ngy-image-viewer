@@ -63,10 +63,50 @@ main.rs  →  app.rs  →  ui/  →  render/  →  model/  →  decode/
 | `render/` | 像素 → GPU 纹理 → canvas 自绘 | 交互、文件系统 |
 | `ui/` | 界面与交互状态：标题栏 + 菜单栏、工具栏、状态栏、EXIF 面板 | 像素格式、通道顺序 |
 | `input/` | 手势状态机、滚轮换算（纯逻辑） | 元素与事件回调的接线（那在 `ui/view.rs`） |
-| `fs_ops/` | 剪贴板 / 打开 / 另存为 / 重命名 / 回收站 | 界面 |
+| `fs_ops/` | 剪贴板 / 打开 / 另存为 / 重命名 / 回收站 / **用户偏好读写** | 界面 |
 | `ui/command.rs` | 动作清单、菜单结构、快捷键表（**零 UI 依赖**） | gpui、窗口、元素 |
+| `ui/theme.rs` | 两套皮肤的**颜色取值** + 尺寸/时长常量 | 窗口、平台、状态 |
 
 `render/` 是整个项目里**唯一**同时知道「图像数据长什么样」和「GPUI 怎么画」的地方。像素格式、通道顺序、纹理上限、坐标系换算都关在这一层。
+
+---
+
+## 3. 皮肤（深色 / 浅色）
+
+### 两套皮肤是「两列颜色」，不是「两套代码」
+
+`ui/theme.rs` 用一个 `Skin` 结构体承载两套取值（模块级 `static DARK` / `LIGHT`，
+`LazyLock` 构造 —— `rgb()` 与 `Rgba → Hsla` 都不是 const 函数）。**布局、尺寸、动效两套完全相同**，
+`Skin` 里只放颜色。新增一个颜色时两套都必须填上：`Skin` 的字段没有默认值，漏一个就编译不过。
+不要在各个绘制函数里写 `if dark {..} else {..}` —— 那会让「漏了浅色那一支」变成
+只在某个界面上才看得见、且是白底白字这种最难自查的形态。
+
+### 「跟随系统」靠每帧读平台值，不靠自持布尔
+
+- 视图持有的是**用户偏好**（`Preference::{System, Fixed(Polarity)}`），**不是**「当前是哪套皮肤」。
+- 当前皮肤由 `ImageViewerView::current_skin(window.appearance())` 每帧现算。
+- `window.appearance()` 是平台值：Windows 走 `ImmersiveColorSet` 消息 →
+  `gpui-pre-windows` 的 `handle_system_theme_changed` → `appearance_changed` → 窗口重绘。
+  因此**不需要** `observe_window_appearance` 订阅，也不需要任何状态副本。
+- 自己缓存一个「现在是深色」的布尔就会重演 `fullscreen` 那个缺陷（见下方 GPUI 事实清单）：
+  自持的那份先于平台生效，随后打架，界面停在旧配色上直到用户碰一下鼠标。
+
+### 手动覆盖与持久化
+
+- 菜单「视图」里有三项互斥项：跟随系统 / 深色 / 浅色（`Command::SkinFollowSystem` /
+  `SkinDark` / `SkinLight`），当前生效的那个用主色 + `●` 标出。
+- 选择写在 `%APPDATA%/ngy-image-viewer/config`（macOS / Linux 见 `fs_ops/settings.rs`），
+  极简 `key=value`。**删掉文件即回到跟随系统。**
+- **读只有一次，且在建窗之前**（`app.rs` 的 `run`）：`App::window_appearance()` 在之后返回的
+  就是覆盖值，窗口一出生就是对的。视图的 `preference` 字段默认 `System`，
+  由 `set_loaded_preference` 覆盖 —— 别在 `new()` 里再读一次盘。
+- **写永远在后台线程**（`view.rs::set_preference` 里 `std::thread::spawn`）：
+  一次 `write` 是几毫秒，放渲染循环里就是几毫秒的卡顿。
+- 手动覆盖时还调用 `cx.set_window_appearance(...)` —— 只有 **macOS** 真的实现了它
+  （`App::set_window_appearance`，`gpui-pre-0.3.4/src/app.rs:1403`），Windows 是空实现。
+  自绘配色不依赖它，调用只是为了平台侧那点外围（标题栏按钮、边框）对得上。
+
+`App::set_window_appearance` 的语义是**清除覆盖**用 `None`，不是「设成跟随系统的值」。
 
 ---
 

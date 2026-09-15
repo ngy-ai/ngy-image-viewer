@@ -42,6 +42,7 @@ use std::time::Instant;
 use gpui_kit::*;
 
 use crate::decode::{ImageData, orientation};
+use crate::fs_ops::Preference;
 use crate::fs_ops::file_ops::{self, Bitmap};
 use crate::fs_ops::neighbors::NeighborsTask;
 use crate::input::{PanGesture, zoom_factor_from_lines, zoom_factor_from_pixels};
@@ -51,7 +52,8 @@ use crate::perf;
 use crate::render::{Surface, ViewportConfig, ViewportSlot, viewport};
 use crate::trace;
 use crate::ui::command::{Command, command_for_keystroke};
-use crate::ui::{menu, panels, theme};
+use crate::ui::theme::{self, Skin};
+use crate::ui::{menu, panels};
 
 /// 浮层的类型，决定配色。
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -63,12 +65,12 @@ pub enum ToastKind {
 }
 
 impl ToastKind {
-    fn color(self) -> Hsla {
+    fn color(self, skin: &Skin) -> Hsla {
         match self {
-            Self::Info => theme::info(),
-            Self::Success => theme::success(),
-            Self::Warning => theme::warning(),
-            Self::Error => theme::danger(),
+            Self::Info => skin.info,
+            Self::Success => skin.success,
+            Self::Warning => skin.warning,
+            Self::Error => skin.danger,
         }
     }
 }
@@ -198,6 +200,17 @@ pub struct ImageViewerView {
 
     /// 首帧是否已经呈现过图像（用于打点，只报一次）。
     reported_first_frame: bool,
+
+    /// 用户对皮肤的偏好（跟随系统 / 固定深色 / 固定浅色）。
+    ///
+    /// 它**不是**「当前用的是哪套皮肤」—— 后者每帧由 [`current_skin`](Self::current_skin)
+    /// 从「这个偏好 + 平台当下报的外观」现算。理由与 `fullscreen` 完全相同：
+    /// 系统外观是平台状态，自己缓存一份就会在「用户改了系统主题」与「平台把新值
+    /// 送过来」之间那段时间里与之打架，表现是界面停在旧配色上直到用户碰一下鼠标。
+    ///
+    /// 手动选了深色之后，这个偏好在本次会话里就一直压着系统值，
+    /// 直到用户重新选「跟随系统」。
+    preference: Preference,
 }
 
 /// 正在等待用户通过系统对话框做选择的一项。
@@ -247,7 +260,82 @@ impl ImageViewerView {
             fullscreen: false,
             fullscreen_pending: 0,
             reported_first_frame: false,
+            // 默认「跟随系统」。真正的偏好在建窗之前由 `app.rs` 读一次，
+            // 经 `set_loaded_preference` 送进来 —— 这里再读一次盘是多余的 IO，
+            // 而且会给「视图的偏好」与「平台已经切过去的外观」制造一个可能不一致的
+            // 中间态。默认值必须与 `Preference::default()` 一致。
+            preference: Preference::default(),
         }
+    }
+
+    /// 覆盖从磁盘读来的偏好。
+    ///
+    /// 「读配置」这件事必须在**建窗之前**发生：视图构造时窗口还不存在，
+    /// 而平台需要知道要不要把外观覆盖成用户选的那一套，否则窗口会先以系统配色
+    /// 呈现一帧再跳成用户选的配色。`app.rs` 读一次交给这里，视图不再读第二次。
+    pub fn set_loaded_preference(&mut self, preference: Preference) {
+        self.preference = preference;
+    }
+
+    /// 用户当前的皮肤偏好（供 `app.rs` 决定要不要给平台设外观覆盖）。
+    pub fn preference(&self) -> Preference {
+        self.preference
+    }
+
+    /// 当下该用哪套皮肤。
+    ///
+    /// **每帧现算，不缓存**：`system` 由调用方从窗口（或 `App`）读来，
+    /// 因此「系统切了主题」与「用户改了偏好」两条路径都能立刻反映到画面上，
+    /// 不需要任何一个自持的「现在是深色还是浅色」布尔。
+    fn current_skin(&self, system: WindowAppearance) -> &'static Skin {
+        self.preference.skin_for(theme::Polarity::of(system))
+    }
+
+    /// 换一套皮肤偏好：写盘、通知平台、请求重绘。
+    ///
+    /// 三件事都在这里做，因为三个入口（菜单三项）共用它，
+    /// 漏掉任何一步都会表现为「点了没反应」或「这次有效下次忘了」。
+    fn set_preference(&mut self, preference: Preference, cx: &mut Context<Self>) {
+        if self.preference == preference {
+            // 重复点同一项：什么都不做。既避免多余的写盘，
+            // 也避免给平台反复设同一个覆盖值（那会让窗口再走一次 DWM 重配）。
+            return;
+        }
+        self.preference = preference;
+        trace::step(
+            "theme",
+            format!(
+                "皮肤偏好 → {}（{}）",
+                match preference {
+                    Preference::System => "跟随系统",
+                    Preference::Fixed(polarity) => polarity.label(),
+                },
+                if preference.is_overriding_system() {
+                    "不再读取系统外观"
+                } else {
+                    "读系统外观"
+                },
+            ),
+        );
+        // 写盘放到后台线程：一次 `write` 是几毫秒，但把它放在渲染循环里
+        // 就是几毫秒的卡顿，而这类卡顿会被归因成「这个看图器有点钝」。
+        // 写失败不致命（下次启动退回跟随系统），但要在日志里留一行 ——
+        // 否则「设了没记住」会变成一个无法复盘的现象。
+        std::thread::spawn(move || {
+            if let Err(error) = crate::fs_ops::settings::store(preference) {
+                trace::fail("theme", format!("皮肤偏好写盘失败：{error}"));
+            }
+        });
+        // 平台侧的外观覆盖：只有 macOS 真的实现了它（`set_window_appearance`），
+        // 其它平台是空实现。这里仍然调用 —— 让「窗口的系统级外观」与「我们自绘的
+        // 配色」在支持的平台上保持一致（例如 macOS 的红绿灯按钮、滚动条配色），
+        // 而在不支持的平台上它是一次无害的空调用，自绘配色照常生效。
+        cx.set_window_appearance(match preference {
+            Preference::System => None,
+            Preference::Fixed(theme::Polarity::Dark) => Some(WindowAppearance::Dark),
+            Preference::Fixed(theme::Polarity::Light) => Some(WindowAppearance::Light),
+        });
+        cx.notify();
     }
 
     /// 装载一次打开的结果。
@@ -623,6 +711,14 @@ impl ImageViewerView {
             Command::FlipVertical => self.flip_vertical(cx),
             Command::ToggleInfoPanel => self.toggle_info_panel(cx),
             Command::ToggleFullscreen => self.toggle_fullscreen(window, cx),
+            // 皮肤三项是同一件事的三个取值，共用一条路径。
+            Command::SkinFollowSystem => self.set_preference(Preference::System, cx),
+            Command::SkinDark => {
+                self.set_preference(Preference::Fixed(theme::Polarity::Dark), cx)
+            }
+            Command::SkinLight => {
+                self.set_preference(Preference::Fixed(theme::Polarity::Light), cx)
+            }
             // 退出整个应用而不是关掉这个窗口：本程序只有这一个窗口，
             // 两者在当前实现下等价，但「退出」是用户按下菜单项时的心智模型。
             Command::Quit => cx.quit(),
@@ -1068,7 +1164,12 @@ impl ImageViewerView {
     }
 
     /// 占位层：空状态给一个居中的「打开图片」按钮；加载中与失败态给文字说明。
-    fn placeholder(&self, window: &Window, view: &Entity<ImageViewerView>) -> AnyElement {
+    fn placeholder(
+        &self,
+        skin: &Skin,
+        window: &Window,
+        view: &Entity<ImageViewerView>,
+    ) -> AnyElement {
         // 空状态：画布正中一个「打开图片」按钮，点开系统文件对话框。
         // 按钮下方留一行极弱的提示，告诉用户还有拖入与命令行两种入口；
         // 但主操作只有一个，避免空界面上堆一堆文字。
@@ -1087,12 +1188,12 @@ impl ImageViewerView {
                         .px_6()
                         .py_3()
                         .rounded_lg()
-                        .bg(theme::primary())
-                        .text_color(theme::text())
+                        .bg(skin.primary)
+                        .text_color(skin.text)
                         .text_size(px(15.0))
                         .font_weight(FontWeight::MEDIUM)
                         .cursor_pointer()
-                        .hover(|style| style.bg(theme::primary_hover()))
+                        .hover(|style| style.bg(skin.primary_hover))
                         .on_mouse_down(MouseButton::Left, move |_, _, cx| {
                             // 走与菜单里「打开…」完全相同的路径（系统对话框在独立线程弹）。
                             view.update(cx, |this, cx| this.open_dialog(cx));
@@ -1101,7 +1202,7 @@ impl ImageViewerView {
                 )
                 .child(
                     div()
-                        .text_color(theme::text_faint())
+                        .text_color(skin.text_faint)
                         .text_size(px(12.0))
                         .child(format!(
                             "也可以把图片拖进来，或执行 {} <图片路径>",
@@ -1123,10 +1224,10 @@ impl ImageViewerView {
                 (
                     format!("正在打开 {name}"),
                     format!("已用时 {elapsed:.0} ms"),
-                    theme::info(),
+                    skin.info,
                 )
             }
-            Phase::Failed { message, detail } => (message.clone(), detail.clone(), theme::danger()),
+            Phase::Failed { message, detail } => (message.clone(), detail.clone(), skin.danger),
             Phase::Ready => return div().into_any_element(),
         };
 
@@ -1151,13 +1252,13 @@ impl ImageViewerView {
                 div()
                     .max_w(px(520.0))
                     .text_center()
-                    .text_color(theme::text_muted())
+                    .text_color(skin.text_muted)
                     .text_size(px(12.0))
                     .child(detail),
             )
             .child(
                 div()
-                    .text_color(theme::text_faint())
+                    .text_color(skin.text_faint)
                     .text_size(px(10.0))
                     .child(format!("屏幕缩放 {ratio:.2}×")),
             )
@@ -1165,7 +1266,7 @@ impl ImageViewerView {
     }
 
     /// 浮层：底部居中，2 秒后自动淡出。
-    fn toast_layer(&mut self) -> AnyElement {
+    fn toast_layer(&mut self, skin: &Skin) -> AnyElement {
         let toasts = self.live_toasts();
         let Some(latest) = toasts.last() else {
             return div().into_any_element();
@@ -1183,10 +1284,10 @@ impl ImageViewerView {
                     .px_4()
                     .py_2()
                     .rounded_md()
-                    .bg(theme::surface_active())
+                    .bg(skin.surface_active)
                     .border_1()
-                    .border_color(latest.kind.color())
-                    .text_color(theme::text())
+                    .border_color(latest.kind.color(skin))
+                    .text_color(skin.text)
                     .text_size(px(12.0))
                     .child(latest.text.clone()),
             )
@@ -1194,29 +1295,34 @@ impl ImageViewerView {
     }
 
     /// 画布区块：图像 + 占位层 + 浮层。
-    fn canvas_area(&mut self, window: &Window, view: &Entity<ImageViewerView>) -> AnyElement {
+    fn canvas_area(
+        &mut self,
+        skin: &Skin,
+        window: &Window,
+        view: &Entity<ImageViewerView>,
+    ) -> AnyElement {
         let logical = self
             .document
             .as_ref()
             .map(|document| document.logical_size())
             .unwrap_or(ImageSize::ZERO);
 
-        let placeholder = self.placeholder(window, view);
-        let toast = self.toast_layer();
+        let placeholder = self.placeholder(skin, window, view);
+        let toast = self.toast_layer(skin);
 
         let mut area = div()
             .flex_1()
             .relative()
             .overflow_hidden()
-            .bg(theme::canvas())
+            .bg(skin.canvas)
             .child(viewport(ViewportConfig {
                 surface: self.surface.clone(),
                 logical_size: logical,
                 transform: self.transform,
                 frame_index: self.frame_index,
                 slot: self.viewport.clone(),
-                background: theme::canvas(),
-                checker: theme::checkerboard(),
+                background: skin.canvas,
+                checker: skin.checker,
             }))
             .child(placeholder);
 
@@ -1227,7 +1333,7 @@ impl ImageViewerView {
                     .top_0()
                     .right_0()
                     .bottom_0()
-                    .child(panels::info_panel(self.document.as_ref())),
+                    .child(panels::info_panel(skin, self.document.as_ref())),
             );
         }
 
@@ -1287,6 +1393,13 @@ impl Render for ImageViewerView {
         // 0. 全屏状态每帧从平台读一次。往下「画不画界面」与滚轮锚点换算都看它，
         //    所以必须在构建元素树之前刷新。
         self.refresh_fullscreen(window);
+
+        // 0a. 皮肤也每帧现算一次。`window.appearance()` 是平台值，系统主题一变
+        //     它就变了（Windows 走 `ImmersiveColorSet` 消息），因此「跟随系统」
+        //     不需要任何自持的状态或额外订阅 —— 与上面那条同一个理由。
+        //     手动选了皮肤的会话里，`current_skin` 直接返回固定的那一套，
+        //     系统怎么变都不影响。
+        let skin = self.current_skin(window.appearance());
 
         // 1. 先把后台结果收回来 —— 这一帧就能显示图像，而不是等到下一帧。
         self.pump_task();
@@ -1374,7 +1487,7 @@ impl Render for ImageViewerView {
 
         // 先构建画布区（需要 `&mut self`），再构建其它区块（只读 `&self`）。
         // 顺序反过来的话，工具栏持有的不可变借用会与画布区的可变借用冲突。
-        let area = self.canvas_area(window, &view_handle);
+        let area = self.canvas_area(skin, window, &view_handle);
         let stage = Self::stage(area, cx);
 
         // 有没有打开图片，决定「用不用得上完整界面」。注意它与下面 `compact` 的区别：
@@ -1395,8 +1508,8 @@ impl Render for ImageViewerView {
             // `relative` 是下拉浮层的前提：它用绝对定位挂在根容器上，
             // 需要一个明确的包含块，否则会退化成相对窗口定位。
             .relative()
-            .bg(theme::canvas())
-            .text_color(theme::text())
+            .bg(skin.canvas)
+            .text_color(skin.text)
             .track_focus(&self.focus_handle)
             .on_key_down(cx.listener(|this, event, window, cx| {
                 this.on_key_down(event, window, cx)
@@ -1416,6 +1529,7 @@ impl Render for ImageViewerView {
             root.child(stage).into_any_element()
         } else {
             let title_bar = menu::title_bar(
+                skin,
                 self.document.as_ref(),
                 self.menu,
                 !compact,
@@ -1423,6 +1537,7 @@ impl Render for ImageViewerView {
                 window,
             );
             let toolbar = panels::toolbar(
+                skin,
                 self.document.as_ref(),
                 zoom_percent,
                 fits,
@@ -1433,7 +1548,7 @@ impl Render for ImageViewerView {
             let menu_layer = if compact {
                 div().into_any_element()
             } else {
-                menu::menu_layer(self.menu, has_image, &view_handle)
+                menu::menu_layer(skin, self.menu, has_image, self.preference, &view_handle)
             };
 
             let root = root.child(title_bar).child(toolbar).child(stage);
@@ -1441,7 +1556,7 @@ impl Render for ImageViewerView {
             let root = if compact {
                 root
             } else {
-                root.child(panels::status_bar(self.document.as_ref(), zoom_percent))
+                root.child(panels::status_bar(skin, self.document.as_ref(), zoom_percent))
             };
             // 下拉浮层必须是最后一个孩子：GPUI 按树序绘制，后画的盖住先画的。
             // 放在标题栏里（它的逻辑归属处）会被后画的画布整块盖住。
