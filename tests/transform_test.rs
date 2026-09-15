@@ -187,6 +187,66 @@ fn actual_size_means_one_image_pixel_per_device_pixel() {
 }
 
 #[test]
+fn initial_view_stays_at_1_to_1_when_the_image_fits() {
+    // 装得下就用 1:1：此时若改用「适应窗口」，小图会被放大到铺满窗口、
+    // 先被插值糊一遍 —— 用户第一眼看到的已经不是自己的图。
+    let image = Size::new(600.0, 400.0);
+    let viewport = Size::new(900.0, 700.0);
+
+    let initial = ViewTransform::initial(1.0, image, viewport);
+    assert_eq!(initial.mode(), ZoomMode::Actual);
+    assert!((initial.scale() - 1.0).abs() < 1e-6);
+    assert_eq!(initial.pan(), Vec2::ZERO);
+}
+
+#[test]
+fn initial_view_fits_the_window_when_the_image_overflows() {
+    // 只有一个方向超出也算「装不下」：否则打开就看到被裁掉的一条边。
+    let image = Size::new(1200.0, 400.0);
+    let viewport = Size::new(800.0, 600.0);
+
+    let initial = ViewTransform::initial(1.0, image, viewport);
+    assert_eq!(initial.mode(), ZoomMode::Fit);
+
+    let content = initial.content_rect(image, viewport);
+    assert!(content.origin.x >= -0.01 && content.origin.y >= -0.01, "{content:?}");
+    assert!(content.max().x <= viewport.width + 0.01);
+    assert!(content.max().y <= viewport.height + 0.01);
+}
+
+#[test]
+fn initial_view_compares_scales_not_raw_sizes() {
+    // 200% 缩放的高分屏上，1:1 的倍率是 0.5：1000 逻辑像素的图只占 500 点，
+    // 放进 900 点的画布绰绰有余。直接比尺寸会把它误判成「装不下」而放大。
+    let image = Size::new(1000.0, 800.0);
+    let viewport = Size::new(900.0, 700.0);
+
+    let initial = ViewTransform::initial(2.0, image, viewport);
+    assert_eq!(initial.mode(), ZoomMode::Actual, "200% 屏上这张图装得下");
+    assert!((initial.scale() - 0.5).abs() < 1e-6);
+
+    // 同一块画布、同样的图，1 倍屏上就是真的装不下。
+    let initial = ViewTransform::initial(1.0, image, viewport);
+    assert_eq!(initial.mode(), ZoomMode::Fit);
+}
+
+#[test]
+fn initial_view_falls_back_to_1_to_1_when_the_canvas_is_unmeasured() {
+    // 冷启动时打开结果早于首帧绘制，画布尺寸还是 0 —— 装不装得下无从判断。
+    // 此时退回 1:1（最保守的起点），视图拿到真实尺寸后会再算一次。
+    let image = Size::new(4000.0, 3000.0);
+
+    let initial = ViewTransform::initial(1.0, image, Size::ZERO);
+    assert_eq!(initial.mode(), ZoomMode::Actual);
+    assert!((initial.scale() - 1.0).abs() < 1e-6);
+
+    // 没有图像时同理：倍率与模式定住，不产生 NaN。
+    let initial = ViewTransform::initial(2.0, Size::ZERO, Size::new(800.0, 600.0));
+    assert_eq!(initial.mode(), ZoomMode::Actual);
+    assert!(initial.scale().is_finite());
+}
+
+#[test]
 fn zoom_percent_is_relative_to_the_device_pixel_ratio() {
     let image = Size::new(100.0, 100.0);
     let viewport = Size::new(100.0, 100.0);

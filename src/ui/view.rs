@@ -19,7 +19,7 @@
 //! | 按住左键拖动 | 平移 |
 //! | 双击 | 在「适应窗口」与「1:1」之间切换（带 180ms 缓动） |
 //! | ESC | 关掉展开的菜单；没有菜单时退出全屏 |
-//! | F11 | 切换全屏 |
+//! | F11 | 切换全屏（全屏时标题栏 / 工具栏 / 状态栏一概不画，只剩图像） |
 //! | +/− / 0 / 1 | 放大 / 缩小 / 适应 / 1:1 |
 //! | R / Shift+R | 顺时针 / 逆时针旋转 90° |
 //! | H / V | 水平 / 垂直翻转 |
@@ -36,6 +36,7 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::mpsc::Receiver;
 use std::time::Instant;
 
 use gpui_kit::*;
@@ -81,6 +82,18 @@ struct Toast {
 /// 浮层停留时长。
 const TOAST_LIFETIME_MS: u64 = 2000;
 
+/// 全屏切换后，最多再持续请求几帧。
+///
+/// Windows 上 `toggle_fullscreen` 是**异步投递**的（`gpui-pre-windows` 里走
+/// `executor.spawn`），平台的全屏标志不会在调用的当下翻面。界面完全由那个标志
+/// 驱动，所以这段时间必须保持重绘，否则切换会停在旧样子上 —— 直到用户碰一下
+/// 鼠标触发重绘才突然变，表现为「按了 F11 但界面过了一会儿才动」。
+///
+/// 3 帧足够跨过一次事件循环；它不是对延迟的预估，而是「万一平台压根没切、
+/// 或本平台不支持全屏」时的兜底：数到零就停，界面如实反映平台状态，
+/// 不会为了等一个永远不会来的状态而空转。
+const FULLSCREEN_SETTLE_FRAMES: u8 = 3;
+
 /// 视图当前处于哪个阶段。
 enum Phase {
     /// 没有指定文件。
@@ -121,10 +134,23 @@ pub struct ImageViewerView {
     /// 不该让上一张图的预解码结果被错当成下一张图的邻居。
     preload_tasks: Option<(Option<OpenTask>, Option<OpenTask>)>,
 
+    /// 正在等待用户通过系统对话框（打开 / 另存为 / 重命名）做选择的接收端。
+    ///
+    /// 系统对话框在自己的线程上跑模态循环，主线程只在这里存下接收端、继续泵
+    /// GPUI 事件循环；结果由 `pump_dialog` 在渲染循环里取回。这样对话框打开期间
+    /// 把焦点切回主窗口，窗口照常响应，不会被系统标成「未响应」。
+    pending_dialog: Option<PendingDialog>,
+
     transform: ViewTransform,
     viewport: ViewportSlot,
     /// 上一次渲染时画布的尺寸，用来判断「窗口变了没有」。
     last_viewport: ImageSize,
+    /// 刚打开一张图，但画布尺寸还没测到，初始视图尚未定下来。
+    ///
+    /// 初始视图要在「1:1」与「适应窗口」之间二选一，判据需要视口尺寸。冷启动时
+    /// 打开结果早于首帧绘制（画布尺寸还是 0），只能先按 1:1 摆好并挂起这一位，
+    /// 等下一帧读到真实尺寸再定（见 `apply_initial_view`）。
+    initial_view_pending: bool,
 
     pan: PanGesture,
 
@@ -149,8 +175,32 @@ pub struct ImageViewerView {
 
     toasts: Vec<Toast>,
 
+    /// 窗口当前是否全屏。**每帧从平台读一次**（见 `refresh_fullscreen`），
+    /// 不在切换的那一刻就地翻转：自持的那份会在异步切换落地前与平台打架。
+    fullscreen: bool,
+    /// 刚请求过全屏切换、平台状态还没翻面时，剩下的持续重绘帧数。
+    fullscreen_pending: u8,
+
     /// 首帧是否已经呈现过图像（用于打点，只报一次）。
     reported_first_frame: bool,
+}
+
+/// 正在等待用户通过系统对话框做选择的一项。
+///
+/// 系统对话框（打开 / 另存为 / 重命名）在自己的线程上跑模态循环，主线程通过
+/// 轮询接收端取结果 —— 因此主线程在对话框打开期间始终在泵 GPUI 消息循环，
+/// 切回主窗口也不会被系统标记为「未响应」。
+enum PendingDialog {
+    /// 「打开」：结果直接走 `open_path`。
+    Open(Receiver<Option<PathBuf>>),
+    /// 「另存为」：结果出来时把当前文档编码保存到该路径。
+    SaveAs(Receiver<Option<PathBuf>>),
+    /// 「重命名」：必须记住「被改名的源文件」是谁，否则改名会去动一个
+    /// 可能已经不存在的老路径。
+    Rename {
+        current: PathBuf,
+        rx: Receiver<Option<PathBuf>>,
+    },
 }
 
 impl ImageViewerView {
@@ -164,9 +214,11 @@ impl ImageViewerView {
             neighbors_task: None,
             preloaded: HashMap::new(),
             preload_tasks: None,
+            pending_dialog: None,
             transform: ViewTransform::default(),
             viewport: ViewportSlot::default(),
             last_viewport: ImageSize::ZERO,
+            initial_view_pending: false,
             pan: PanGesture::default(),
             info_open: false,
             focus_handle: cx.focus_handle(),
@@ -175,6 +227,8 @@ impl ImageViewerView {
             frame_index: 0,
             animation_started: Instant::now(),
             toasts: Vec::new(),
+            fullscreen: false,
+            fullscreen_pending: 0,
             reported_first_frame: false,
         }
     }
@@ -210,16 +264,16 @@ impl ImageViewerView {
             Ok(document) => {
                 match Surface::build(&document) {
                     Ok(surface) => {
-                        // 打开图片的起点是 **1:1 原尺寸**，不是「适应窗口」（产品选择）。
-                        // 想铺满视口点「适应窗口」或双击即可。
-                        //
-                        // 这里可能还没测到画布尺寸（冷启动时打开早于首帧绘制，`last_viewport`
-                        // 仍是 0×0）：`actual_size` 会把倍率与模式定死，平移约束等拿到真实
-                        // 视口后由 `apply_viewport_change` 补一次 —— 注意 Actual 模式下它只夹
-                        // 平移量、不改倍率，所以 1:1 不会因为窗口尺寸变化而漂移。
+                        // 打开图片的起点是「1:1 优先，装不下就适应窗口」，
+                        // 最终由 `apply_initial_view` 拿真实画布尺寸判定（见
+                        // `ViewTransform::initial`）。这里先按 1:1 摆好：冷启动时
+                        // 打开结果早于首帧绘制，`last_viewport` 还是 0×0，此刻无从
+                        // 判断装不装得下，只能先定住倍率与模式，免得中间某一帧看到
+                        // 一个空变换；真实尺寸一到，下一帧就重算（通常就在同一帧内）。
                         self.transform = ViewTransform::default();
                         self.transform
                             .actual_size(1.0, document.logical_size(), self.last_viewport);
+                        self.initial_view_pending = true;
                         // 邻居列表与首帧并行：目录枚举在自己的线程上跑，
                         // 这里只是派发，不等待 —— 首帧时刻一分都不让。
                         // 路径要先取走：document 马上被移进 self.document。
@@ -241,13 +295,14 @@ impl ImageViewerView {
                         trace::step(
                             "view",
                             format!(
-                                "进入 Ready：模式={:?} 初始倍率={:.4} 平移=({:.2},{:.2}) 画布={:.2}×{:.2}（打开即 1:1；画布为 0 时下一帧只夹平移、不改倍率）",
+                                "进入 Ready：模式={:?} 初始倍率={:.4} 平移=({:.2},{:.2}) 画布={:.2}×{:.2}（先按 1:1 保底，初始视图待定={}；装不下会改成适应窗口）",
                                 self.transform.mode(),
                                 self.transform.scale(),
                                 self.transform.pan().x,
                                 self.transform.pan().y,
                                 self.last_viewport.width,
                                 self.last_viewport.height,
+                                self.initial_view_pending,
                             ),
                         );
                     }
@@ -278,6 +333,80 @@ impl ImageViewerView {
                 );
             }
         }
+    }
+
+    /// 为刚打开的那张图定下初始视图。
+    ///
+    /// 只在「打开了新图、但画布尺寸还没测到」时起作用：冷启动时打开结果早于首帧绘制，
+    /// `last_viewport` 还是 0×0，`ViewTransform::initial` 无从判断装不装得下，只能先
+    /// 退回 1:1。这里补上真实尺寸后的那次判定 —— 判定口径与「适应窗口」一致都是
+    /// 逻辑点，高分屏下的换算由 `ViewTransform::initial` 内部的倍率比较承担。
+    fn apply_initial_view(&mut self, window: &Window) {
+        if !self.initial_view_pending {
+            return;
+        }
+        let Some(document) = self.document.as_ref() else {
+            return;
+        };
+        let viewport = self.last_viewport;
+        if viewport.is_empty() {
+            // 画布还没量到尺寸，继续等下一帧。图像没上屏前用户也无从操作，
+            // 所以这一位不会被晾在这里太久。
+            return;
+        }
+
+        let image = document.logical_size();
+        self.initial_view_pending = false;
+        self.transform = ViewTransform::initial(pixel_ratio_of(window), image, viewport);
+        trace::step(
+            "view",
+            format!(
+                "初始视图判定：图像 {:.0}×{:.0} 画布 {:.0}×{:.0} → 模式={:?} 倍率={:.4}",
+                image.width,
+                image.height,
+                viewport.width,
+                viewport.height,
+                self.transform.mode(),
+                self.transform.scale(),
+            ),
+        );
+    }
+
+    /// 每次渲染前把系统对话框的结果取回来（与 `pump_task` 同一条时序约定）。
+    ///
+    /// 关键：取结果用的是 `try_recv()` —— 主线程**从不**在这里阻塞，即使对话框还开着、
+    /// 用户还没选，也只是把 `pending_dialog` 放回原位等下一帧。这正是「打开文件对话框时
+    /// 切回主窗口不会卡死」的根因修复：主线程一直空闲在事件循环里，随时能响应
+    /// WM_PAINT / 鼠标 / 键盘。
+    fn pump_dialog(&mut self, cx: &mut Context<Self>) {
+        let Some(pending) = self.pending_dialog.take() else {
+            return;
+        };
+        // 只问接收端有没有消息，不 `recv()` —— 否则主线程又被卡住。
+        let received = match &pending {
+            PendingDialog::Open(rx)
+            | PendingDialog::SaveAs(rx)
+            | PendingDialog::Rename { rx, .. } => rx.try_recv(),
+        };
+        match received {
+            Ok(Some(path)) => {
+                // `pending` 已移出 `self`，这里按类型分派后续动作，互不借用。
+                match pending {
+                    PendingDialog::Open(_) => self.open_path(path, cx),
+                    PendingDialog::SaveAs(_) => self.perform_save_as(path),
+                    PendingDialog::Rename { current, .. } => self.perform_rename(current, path),
+                }
+            }
+            // 用户取消：什么都不做，丢弃即可。
+            Ok(None) => {}
+            // 还没选完：放回原位，下一帧再问。
+            Err(std::sync::mpsc::TryRecvError::Empty) => {
+                self.pending_dialog = Some(pending);
+            }
+            // 对话框线程异常退出（极少）：等同取消。
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {}
+        }
+        cx.notify();
     }
 
     /// 每次渲染前把后台任务的结果取回来。
@@ -379,6 +508,9 @@ impl ImageViewerView {
         };
         let logical = document.logical_size();
         let viewport = self.last_viewport;
+        // 用户已经自己动过视图了（缩放、平移、适应窗口、双击…）。
+        // 初始视图的待定判定就此作废：否则下一帧拿到画布尺寸时会把他刚做的操作覆盖掉。
+        self.initial_view_pending = false;
         action(self, logical, viewport);
     }
 
@@ -471,7 +603,7 @@ impl ImageViewerView {
             Command::FlipHorizontal => self.flip_horizontal(cx),
             Command::FlipVertical => self.flip_vertical(cx),
             Command::ToggleInfoPanel => self.toggle_info_panel(cx),
-            Command::ToggleFullscreen => window.toggle_fullscreen(),
+            Command::ToggleFullscreen => self.toggle_fullscreen(window, cx),
             // 退出整个应用而不是关掉这个窗口：本程序只有这一个窗口，
             // 两者在当前实现下等价，但「退出」是用户按下菜单项时的心智模型。
             Command::Quit => cx.quit(),
@@ -481,12 +613,20 @@ impl ImageViewerView {
     }
 
     /// 「打开…」：走系统文件对话框，再复用「拖入文件」那条路径。
+    /// 「打开…」：走系统文件对话框，再复用「拖入文件」那条路径。
+    ///
+    /// 非阻塞：对话框在它自己的线程上跑，主线程只存下接收端、继续泵事件循环；
+    /// 用户选完（或取消）由 `pump_dialog` 在渲染循环里收结果。这样对话框打开期间
+    /// 切回主窗口，主窗口照常响应，不会被系统标成「未响应」。
     fn open_dialog(&mut self, cx: &mut Context<Self>) {
-        // `None` 表示用户取消 —— 取消不是错误，什么都不做即可。
-        let Some(path) = file_ops::pick_open_path() else {
+        // 已经有对话框在等：不再叠第二个。用户在对话框打开期间仍能与主窗口交互，
+        // 可能再次触发 Ctrl+O / 菜单项，这里挡掉。
+        if self.pending_dialog.is_some() {
             return;
-        };
-        self.open_path(path, cx);
+        }
+        // 非阻塞：立刻拿回接收端，主线程继续泵 GPUI 的消息循环。
+        self.pending_dialog = Some(PendingDialog::Open(file_ops::pick_open_path()));
+        cx.notify();
     }
 
     /// 把「现在在看什么」同步给窗口标题。
@@ -590,16 +730,27 @@ impl ImageViewerView {
         }
     }
 
-    pub fn save_as(&mut self, _cx: &mut Context<Self>) {
+    pub fn save_as(&mut self, cx: &mut Context<Self>) {
+        // 对话框已开：避免叠第二个（用户在对话框打开期间仍可与主窗口交互）。
+        if self.pending_dialog.is_some() {
+            return;
+        }
         let Some(document) = self.document.as_ref() else {
             return;
         };
         let (suggested, _) = file_ops::suggest_save_name(document.path(), document.format());
         let directory = document.path().parent().map(|path| path.to_path_buf());
-        let Some(destination) = file_ops::pick_save_path(&suggested, directory.as_deref()) else {
-            return;
-        };
+        // 非阻塞：把目标路径的获取交给后台线程，结果由 `pump_dialog` 收。
+        self.pending_dialog = Some(PendingDialog::SaveAs(file_ops::pick_save_path(
+            &suggested,
+            directory.as_deref(),
+        )));
+        cx.notify();
+    }
 
+    /// 「另存为」拿到目标路径后的实际写入。从 `pump_dialog` 调，不在 `save_as` 里直接做，
+    /// 是为了让系统对话框的阻塞只发生在它自己的线程上（见 `file_ops::pick_save_path`）。
+    fn perform_save_as(&mut self, destination: PathBuf) {
         let Some((width, height, pixels)) = self.displayed_pixels() else {
             return;
         };
@@ -617,14 +768,28 @@ impl ImageViewerView {
         }
     }
 
-    pub fn rename(&mut self, _cx: &mut Context<Self>) {
+    pub fn rename(&mut self, cx: &mut Context<Self>) {
+        // 对话框已开：避免叠第二个。
+        if self.pending_dialog.is_some() {
+            return;
+        }
         let Some(document) = self.document.as_ref() else {
             return;
         };
         let current = document.path().to_path_buf();
-        let Some(destination) = file_ops::pick_rename_path(&current) else {
-            return;
-        };
+        // 非阻塞：把目标路径的获取交给后台线程，结果由 `pump_dialog` 收。
+        // 必须记住「被改名的源文件」是谁，否则对话框关闭时再去动一个
+        // 可能已经不存在的老路径。
+        self.pending_dialog = Some(PendingDialog::Rename {
+            current,
+            rx: file_ops::pick_rename_path(&current),
+        });
+        cx.notify();
+    }
+
+    /// 「重命名」拿到目标路径后的实际移动。从 `pump_dialog` 调，不在 `rename` 里直接做，
+    /// 是为了让系统对话框的阻塞只发生在它自己的线程上（见 `file_ops::pick_rename_path`）。
+    fn perform_rename(&mut self, current: PathBuf, destination: PathBuf) {
         match file_ops::rename(&current, &destination) {
             Ok(()) => {
                 // 重命名后必须让文档指向新路径，否则「再点一次重命名」
@@ -742,7 +907,56 @@ impl ImageViewerView {
             .as_ref()
             .map(|surface| surface.is_animated())
             .unwrap_or(false);
-        animating || !self.toasts.is_empty() || self.task.is_some() || self.neighbors_task.is_some() || self.preload_tasks.is_some()
+        animating
+            || !self.toasts.is_empty()
+            || self.task.is_some()
+            || self.neighbors_task.is_some()
+            || self.preload_tasks.is_some()
+            || self.pending_dialog.is_some()
+            // 刚按过 F11 / ESC：等平台的全屏标志翻面（见 `FULLSCREEN_SETTLE_FRAMES`）。
+            || self.fullscreen_pending > 0
+    }
+
+    // ---- 全屏 ----
+
+    /// 把平台的全屏状态读进 `self.fullscreen`。
+    ///
+    /// 为什么每帧读而不是在切换时自己翻一位：Windows 的 `toggle_fullscreen` 是异步
+    /// 投递的，就地翻转会先于平台生效，随后平台状态落地时两者就打架了 —— 界面会是
+    /// 「先藏起来、再亮回来」这种最像 bug 的表现。读平台值没有这个问题，代价只是需要
+    /// 多渲染几帧来等它，由 `fullscreen_pending` 负责。
+    ///
+    /// 反过来这也让「平台自己改变全屏」（macOS 的绿色按钮之类）能自动跟上，
+    /// 不需要额外的事件订阅 —— 而窗口事件里本来也没有全屏变化这一项。
+    fn refresh_fullscreen(&mut self, window: &Window) {
+        let fullscreen = window.is_fullscreen();
+        // 打点：全屏相关的问题（按了没反应、界面没跟着变）只能靠这个时间线复盘 ——
+        // 界面上「什么都没发生」和「发生了但画错」在截图里长得一样。
+        if self.fullscreen != fullscreen {
+            trace::step(
+                "view",
+                format!(
+                    "全屏状态 → {}，界面{}",
+                    if fullscreen { "全屏" } else { "窗口" },
+                    if fullscreen { "隐藏标题栏与工具栏" } else { "恢复" },
+                ),
+            );
+        }
+        self.fullscreen = fullscreen;
+        self.fullscreen_pending = self.fullscreen_pending.saturating_sub(1);
+    }
+
+    /// 请求一次全屏切换。
+    ///
+    /// 两个入口（F11 与 ESC）共用这里，免得各自处理一遍「收起菜单、保持重绘」，
+    /// 也就不会出现「一个入口能用、另一个漏了某步」的不一致。
+    fn toggle_fullscreen(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        // 全屏时不画下拉浮层，留着这个下标只会让退出全屏的瞬间冒出一个
+        // 「本来就开着」的菜单。
+        self.menu = None;
+        window.toggle_fullscreen();
+        self.fullscreen_pending = FULLSCREEN_SETTLE_FRAMES;
+        cx.notify();
     }
 
     // ---- 交互 ----
@@ -755,13 +969,11 @@ impl ImageViewerView {
         };
 
         let cursor = Vec2::new(f32::from(event.position.x), f32::from(event.position.y));
-        // 事件坐标是相对窗口的，画布从标题栏 + 工具栏下方开始，这里换算到画布局部坐标。
-        // 少减一项的表现是缩放锚点整体偏移一个标题栏的高度 —— 用户说不出哪里不对，
-        // 只会觉得"缩放时图像在往一边跑"。
-        let cursor = Vec2::new(
-            cursor.x,
-            cursor.y - theme::TITLE_BAR_HEIGHT - theme::TOOLBAR_HEIGHT,
-        );
+        // 事件坐标是相对窗口的，画布却从标题栏 + 工具栏下方开始，这里换算到画布局部坐标。
+        // 少减一项的表现是缩放锚点整体偏移一个栏的高度 —— 用户说不出哪里不对，
+        // 只会觉得"缩放时图像在往一边跑"。全屏时两栏都不存在，所以这个偏移必须
+        // 与「画不画那两栏」用同一个判据（见 `canvas_top_offset`）。
+        let cursor = Vec2::new(cursor.x, cursor.y - canvas_top_offset(self.fullscreen));
 
         self.with_image(|this, logical, viewport| {
             this.transform.zoom_at(cursor, factor, logical, viewport);
@@ -810,8 +1022,7 @@ impl ImageViewerView {
             if self.menu.is_some() {
                 self.close_menu(cx);
             } else {
-                window.toggle_fullscreen();
-                cx.notify();
+                self.toggle_fullscreen(window, cx);
             }
             return;
         }
@@ -1001,14 +1212,68 @@ impl ImageViewerView {
 
         area.child(toast).into_any_element()
     }
+
+    /// 承接画布的那一层。
+    ///
+    /// 它只做两件事：把画布撑满剩余空间，以及承载滚轮与拖拽。
+    ///
+    /// # 为什么全屏与非全屏共用它
+    ///
+    /// 全屏只是不画标题栏 / 工具栏，事件落点一个都不能少。两条分支各写一份的话，
+    /// 漏掉某个绑定（最典型的是滚轮）不会有任何报错，只会表现为「全屏后滚轮不能用」。
+    /// 共用一份绑定就没有这个空间。
+    ///
+    /// # 为什么必须显式声明 flex 容器
+    ///
+    /// `area` 用 `flex_1()` 撑满，而 `flex-grow` 只在 flex 容器里生效。缺了
+    /// `.flex()` 时这一层退化成普通块级容器，`area` 的高度就由内容决定：它唯一的
+    /// 子元素是绝对定位的画布（不占空间），于是高度算出来是 0，画布随之变成
+    /// `宽 × 0`。`paint_image` 在可见区域为空时返回的是 `Ok(())`，所以整个过程
+    /// **没有任何报错**，界面只是一片黑。
+    ///
+    /// 之所以不改成给 `area` 加 `size_full()`：那依赖父级高度已经确定，
+    /// 而这里父级的高度正是由 `flex_1` 决定的 —— 显式声明 flex 容器
+    /// 才让「谁分配空间、谁撑满」这条链路是可读的。
+    fn stage(area: AnyElement, cx: &mut Context<Self>) -> AnyElement {
+        div()
+            .flex()
+            .flex_col()
+            .flex_1()
+            .relative()
+            .on_scroll_wheel(cx.listener(|this, event, _window, cx| {
+                this.on_scroll(event, cx)
+            }))
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, event, window, cx| {
+                    this.on_mouse_down(event, window, cx)
+                }),
+            )
+            .on_mouse_move(cx.listener(|this, event, _window, cx| {
+                this.on_mouse_move(event, cx)
+            }))
+            .on_mouse_up(
+                MouseButton::Left,
+                cx.listener(|this, _event, _window, _cx| this.pan.end()),
+            )
+            .child(area)
+            .into_any_element()
+    }
 }
 
 impl Render for ImageViewerView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // 0. 全屏状态每帧从平台读一次。往下「画不画界面」与滚轮锚点换算都看它，
+        //    所以必须在构建元素树之前刷新。
+        self.refresh_fullscreen(window);
+
         // 1. 先把后台结果收回来 —— 这一帧就能显示图像，而不是等到下一帧。
         self.pump_task();
         self.pump_neighbors();
         self.pump_preloads();
+        // 系统对话框的结果也在每帧取回：这里只 `try_recv`，主线程从不阻塞，
+        // 对话框打开期间切回主窗口也不会卡死。
+        self.pump_dialog(cx);
 
         // 2. 画布尺寸可能刚刚变化（首帧时它还是零），据此重算「适应窗口」。
         let measured = self.viewport.get();
@@ -1029,6 +1294,10 @@ impl Render for ImageViewerView {
                 ),
             );
         }
+
+        // 2a. 刚打开一张图：画布尺寸到手了，这才谈得上「装不装得下」。
+        //     冷启动时打开早于首帧绘制，判定只能推迟到这一帧。
+        self.apply_initial_view(window);
 
         // 2b. 状态自检：Ready 却缺文档或纹理，是「黑屏但没有任何报错」的另一种形态。
         //     正常路径走不到这里，所以一旦出现就必须留痕。
@@ -1085,34 +1354,13 @@ impl Render for ImageViewerView {
         // 先构建画布区（需要 `&mut self`），再构建其它区块（只读 `&self`）。
         // 顺序反过来的话，工具栏持有的不可变借用会与画布区的可变借用冲突。
         let area = self.canvas_area(window, &view_handle);
+        let stage = Self::stage(area, cx);
 
         // 有没有打开图片，决定界面「挤不挤」：
         // - 打开图片（看图模式）→ 标题栏不画菜单、不画底部状态栏，把纵向空间让给图像；
         //   窗口按钮仍保留在标题栏，所以窗口依旧能移动 / 最小化 / 关闭。
         // - 没有图片 → 完整界面（菜单 + 状态栏），画布正中给一个「打开图片」按钮。
         let has_image = self.document.is_some();
-
-        let title_bar = menu::title_bar(
-            self.document.as_ref(),
-            self.menu,
-            !has_image,
-            &view_handle,
-            window,
-        );
-        let toolbar = panels::toolbar(
-            self.document.as_ref(),
-            zoom_percent,
-            fits,
-            self.info_open,
-            &view_handle,
-        );
-        let status = panels::status_bar(self.document.as_ref(), zoom_percent);
-        // 看图模式下菜单已经不可见，下拉浮层无从展开，给一个空元素占位即可。
-        let menu_layer = if has_image {
-            div().into_any_element()
-        } else {
-            menu::menu_layer(self.menu, self.document.is_some(), &view_handle)
-        };
 
         let root = div()
             .flex()
@@ -1129,49 +1377,67 @@ impl Render for ImageViewerView {
             }))
             .on_drop(cx.listener(|this, paths: &ExternalPaths, _window, cx| {
                 this.on_file_drop(paths, cx)
-            }))
-            .child(title_bar)
-            .child(toolbar)
-            .child(
-                // 这一层**必须**是 flex 容器，否则里面的 `area` 高度会塌成 0。
-                //
-                // `area` 用 `flex_1()` 撑满，而 `flex-grow` 只在 flex 容器里生效。
-                // 缺了 `.flex()` 时这一层退化成普通块级容器，`area` 的高度就由内容决定：
-                // 它唯一的子元素是绝对定位的画布（不占空间），于是高度算出来是 0，
-                // 画布随之变成 `宽 × 0`。`paint_image` 在可见区域为空时返回的是
-                // `Ok(())`，所以整个过程**没有任何报错**，界面只是一片黑。
-                //
-                // 之所以不改成给 `area` 加 `size_full()`：那依赖父级高度已经确定，
-                // 而这里父级的高度正是由 `flex_1` 决定的 —— 显式声明 flex 容器
-                // 才让「谁分配空间、谁撑满」这条链路是可读的。
-                div()
-                    .flex()
-                    .flex_col()
-                    .flex_1()
-                    .relative()
-                    .on_scroll_wheel(cx.listener(|this, event, _window, cx| {
-                        this.on_scroll(event, cx)
-                    }))
-                    .on_mouse_down(
-                        MouseButton::Left,
-                        cx.listener(|this, event, window, cx| {
-                            this.on_mouse_down(event, window, cx)
-                        }),
-                    )
-                    .on_mouse_move(cx.listener(|this, event, _window, cx| {
-                        this.on_mouse_move(event, cx)
-                    }))
-                    .on_mouse_up(
-                        MouseButton::Left,
-                        cx.listener(|this, _event, _window, _cx| this.pan.end()),
-                    )
-                    .child(area),
+            }));
+
+        if self.fullscreen {
+            // 全屏：窗口只剩画布本身。标题栏（含窗口按钮）、工具栏、状态栏、
+            // 下拉浮层一概不画 —— 空状态下也一样，全屏这个东西的语义就是
+            // 「把窗口整个让给内容」，哪怕内容此刻只是一个「打开图片」按钮。
+            //
+            // 换掉的只是**内容**：滚轮 / 拖拽 / 缩放锚点所在的 `stage` 两条分支
+            // 共用同一份绑定，分开写迟早会漏掉某个事件 —— 表现就是「全屏后
+            // 滚轮不能用」，而这类缺失在代码评审里几乎看不出来。
+            root.child(stage).into_any_element()
+        } else {
+            let title_bar = menu::title_bar(
+                self.document.as_ref(),
+                self.menu,
+                !has_image,
+                &view_handle,
+                window,
             );
-        // 看图模式下隐藏底部状态栏（菜单已在标题栏里整段跳过）。
-        let root = if has_image { root } else { root.child(status) };
-        // 下拉浮层必须是最后一个孩子：GPUI 按树序绘制，后画的盖住先画的。
-        // 放在标题栏里（它的逻辑归属处）会被后画的画布整块盖住。
-        root.child(menu_layer)
+            let toolbar = panels::toolbar(
+                self.document.as_ref(),
+                zoom_percent,
+                fits,
+                self.info_open,
+                &view_handle,
+            );
+            // 看图模式下菜单已经不可见，下拉浮层无从展开，给一个空元素占位即可。
+            let menu_layer = if has_image {
+                div().into_any_element()
+            } else {
+                menu::menu_layer(self.menu, self.document.is_some(), &view_handle)
+            };
+
+            let root = root.child(title_bar).child(toolbar).child(stage);
+            // 看图模式下隐藏底部状态栏（菜单已在标题栏里整段跳过）。
+            let root = if has_image {
+                root
+            } else {
+                root.child(panels::status_bar(self.document.as_ref(), zoom_percent))
+            };
+            // 下拉浮层必须是最后一个孩子：GPUI 按树序绘制，后画的盖住先画的。
+            // 放在标题栏里（它的逻辑归属处）会被后画的画布整块盖住。
+            root.child(menu_layer).into_any_element()
+        }
+    }
+}
+
+/// 画布在窗口坐标系里的上边界。
+///
+/// 鼠标事件的坐标是相对窗口的，画布却从标题栏 + 工具栏下方开始，凡是要把窗口坐标
+/// 换成画布坐标的地方都得先减掉这一段。抽成一个函数是为了让它与「画不画那两栏」
+/// 用同一个判据：把两处各写一遍，将来改了界面布局就只会改其中一处，
+/// 漏掉的那处表现是「缩放锚点整体偏移一个栏高」—— 用户说不出哪里不对，
+/// 只觉得缩放时图像在往一边跑。
+///
+/// 全屏时两栏都不画，所以这里必须归零，而不是继续按常量减。
+fn canvas_top_offset(fullscreen: bool) -> f32 {
+    if fullscreen {
+        0.0
+    } else {
+        theme::TITLE_BAR_HEIGHT + theme::TOOLBAR_HEIGHT
     }
 }
 
@@ -1208,4 +1474,27 @@ fn env_program_name() -> String {
 #[allow(dead_code)]
 fn type_anchors(data: &ImageData, mode: ZoomMode) -> (usize, ZoomMode) {
     (data.frame_count(), mode)
+}
+
+#[cfg(test)]
+mod tests {
+    // 刻意不用 `use super::*`：本模块（`view.rs`）顶部 `use gpui_kit::*`，
+    // 而开着 `test-support` 时那个 glob 里含 GPUI 自己的 `test` 宏，经 glob 传下来
+    // 会遮蔽内置的 `#[test]`，报的是「recursion limit reached while expanding
+    // `#[test]`」这种看不出根因的错。按需显式导入即可。
+    use super::canvas_top_offset;
+    use crate::ui::theme;
+
+    /// 全屏下画布上边界归零 —— 与非全屏时相差正好一个「标题栏 + 工具栏」。
+    ///
+    /// 这两件事是一体的：界面不画那两栏了，坐标换算也必须跟着归零。任何一面走偏，
+    /// 结果都是滚轮缩放的锚点整体偏一个栏高，而画面上看不出任何异常。
+    #[test]
+    fn fullscreen_lifts_the_canvas_to_the_window_top() {
+        assert_eq!(canvas_top_offset(true), 0.0);
+        assert_eq!(
+            canvas_top_offset(false),
+            theme::TITLE_BAR_HEIGHT + theme::TOOLBAR_HEIGHT
+        );
+    }
 }

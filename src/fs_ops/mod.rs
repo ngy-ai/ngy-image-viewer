@@ -20,8 +20,9 @@
 //!
 //! 1. [`file_ops::delete_to_trash`] 在 Windows 上依赖 `trash` crate 的 COM 单元，
 //!    必须在**已经初始化 COM 的线程**（UI 主线程）上调用；
-//! 2. [`file_ops::pick_save_path`] / [`file_ops::pick_rename_path`] 内部会把阻塞式
-//!    文件对话框放到独立线程上执行，并用 channel 把选择结果交回调用方。
+//! 2. [`file_ops::pick_save_path`] / [`file_ops::pick_rename_path`] / [`file_ops::pick_open_path`]
+//!    内部会把阻塞式文件对话框放到独立线程上执行，并返回结果通道；调用方（UI）在自己的
+//!    事件循环里轮询该通道，因此主线程始终在泵消息循环，对话框打开期间切回主窗口也不会卡死。
 //!
 //! 具体取舍写在各自的函数文档里。
 //!

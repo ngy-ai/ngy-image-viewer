@@ -88,15 +88,26 @@ fn maybe_diag_font_enum(cx: &mut App) {
 
 /// 窗口选项。
 ///
-/// 唯一改了默认值的是 `titlebar.appears_transparent`：让系统不再绘制标题栏，
-/// 改由 `ui/menu.rs` 自绘一条与界面同为深色的标题栏 + 菜单栏。保留系统标题栏的话，
-/// 那条浅色的系统栏会横在沉浸式深色界面之上，一眼就能看出「不是这个程序的一部分」；
-/// 而且我们也没有别的地方可以安放菜单栏（塞进工具栏会和缩放/旋转按钮混成一片）。
+/// 改了两个默认值：
+///
+/// 1. `window_bounds`：默认最大化打开。看图这件事的收益随可视面积单调增长 —— 一张
+///    6000×4000 的照片在 1536×1095 的默认窗口里只能显示一角，用户进来第一件事几乎
+///    必然是最大化，那就别让他多做这一步。**不是**全屏（`Fullscreen`）：全屏会把
+///    自绘标题栏一起藏起来，「还原」就没有落点，也拿不到多显示器下的正常窗口管理。
+///    这里传进去的 bounds 是**还原尺寸** —— 用户点还原 / `Win+↓` 回到的就是它，
+///    所以取显示器给的默认尺寸（居中、必要时按屏幕裁剪），而不是随手一个零值。
+///    平台差异：Windows 是创建后立刻 `SW_MAXIMIZE`，最大化引发的 `WM_SIZE` 会照常
+///    触发重绘，首帧拿到的就已经是正确尺寸。
+/// 2. `titlebar.appears_transparent`：让系统不再绘制标题栏，
+///    改由 `ui/menu.rs` 自绘一条与界面同为深色的标题栏 + 菜单栏。保留系统标题栏的话，
+///    那条浅色的系统栏会横在沉浸式深色界面之上，一眼就能看出「不是这个程序的一部分」；
+///    而且我们也没有别的地方可以安放菜单栏（塞进工具栏会和缩放/旋转按钮混成一片）。
 ///
 /// 代价是 Windows 上要自己画最小化 / 最大化 / 关闭，并把它们声明成对应的
 /// [`WindowControlArea`] 才能拿回系统行为；平台差异见 `ui/menu.rs`。
-fn window_options() -> WindowOptions {
+fn window_options(cx: &App) -> WindowOptions {
     WindowOptions {
+        window_bounds: Some(WindowBounds::Maximized(restore_bounds(cx))),
         titlebar: Some(TitlebarOptions {
             // 任务栏与 Alt+Tab 里显示的名字。打开图片后会由视图改成文件名。
             title: Some(APP_NAME.into()),
@@ -107,6 +118,17 @@ fn window_options() -> WindowOptions {
         }),
         ..WindowOptions::default()
     }
+}
+
+/// 最大化窗口的「还原尺寸」。
+///
+/// 优先用显示器给的默认尺寸：它已经做了「居中 + 按屏幕裁剪」，在 4K 屏与 1366×768 的
+/// 笔记本上都不会大于屏幕。拿不到主显示器时退回 GPUI 自己的默认尺寸并在原点放一个 ——
+/// 这个分支只可能出现在没有显示器的环境里，形状正确比尺寸好看重要。
+fn restore_bounds(cx: &App) -> Bounds<Pixels> {
+    cx.primary_display()
+        .map(|display| display.default_bounds())
+        .unwrap_or_else(|| Bounds::new(point(px(0.0), px(0.0)), DEFAULT_WINDOW_SIZE))
 }
 
 /// 启动应用。阻塞直到窗口关闭。
@@ -165,7 +187,9 @@ pub fn run(options: AppOptions, mut task: Option<OpenTask>) -> anyhow::Result<()
             view
         });
 
-        let window = cx.open_window(window_options(), |window, cx| {
+        // 窗口选项要在 `App` 上查主显示器（最大化的「还原尺寸」取自它），
+        // 所以构造推迟到这里，而不是在 `window_options()` 里凭空造一个尺寸。
+        let window = cx.open_window(window_options(cx), |window, cx| {
             // 约定：每个窗口的第一层必须是 Root。
             cx.new(|cx| Root::new(view.clone(), window, cx))
         });

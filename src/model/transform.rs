@@ -293,6 +293,32 @@ impl ViewTransform {
         self.constrain(image, viewport);
     }
 
+    /// 打开一张图片时的初始视图：**1:1 优先，装不下才适应窗口**。
+    ///
+    /// - 1:1 下装得下视口 → 用 1:1。此时若改用「适应窗口」，会把一张小图放大到
+    ///   铺满窗口、先被插值糊一遍，用户第一眼看到的已经不是自己的图；
+    /// - 1:1 下装不下（任一方向超出）→ 用「适应窗口」。否则打开看到的是被裁掉的
+    ///   一角，还得先按一次「适应窗口」才看得到全貌。
+    ///
+    /// 判据必须落在**倍率**上，不能直接比尺寸：1:1 的倍率是 `1 / pixel_ratio`，
+    /// 在 200% 缩放的屏幕上按尺寸直接比会把「装得下」误判成「装不下」。
+    ///
+    /// 视口尺寸未知（为 0）时退回 1:1 —— 这是最保守的起点，
+    /// 视图拿到真实画布尺寸后会用它再算一次。
+    pub fn initial(pixel_ratio: f32, image: Size, viewport: Size) -> Self {
+        let mut result = Self::default();
+        let actual = 1.0 / pixel_ratio.max(f32::MIN_POSITIVE);
+        let overflows =
+            image.width * actual > viewport.width || image.height * actual > viewport.height;
+
+        if !image.is_empty() && !viewport.is_empty() && overflows {
+            result.fit(image, viewport);
+        } else {
+            result.actual_size(pixel_ratio, image, viewport);
+        }
+        result
+    }
+
     /// 在「适应窗口」与「1:1」之间切换。双击与快捷键都用它。
     ///
     /// 判据是**当前是否已经是适应窗口的倍率**，而不是 `mode`：

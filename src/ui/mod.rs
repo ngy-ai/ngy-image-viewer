@@ -14,6 +14,7 @@
 
 pub mod command;
 pub mod format;
+pub mod icons;
 pub mod menu;
 pub mod panels;
 pub mod theme;

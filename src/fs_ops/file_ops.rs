@@ -326,12 +326,31 @@ pub fn rename(from: &Path, to: &Path) -> Result<(), FileOpError> {
 /// Windows 上 `rfd` 会自行初始化 COM 单元，放到独立线程可正常工作。
 /// macOS 上的原生面板要求在主线程弹出；移植到 macOS 时这里需要改走平台的主线程调度，
 /// 不能照搬「换一个线程」的做法。
-pub fn pick_save_path(suggested_name: &str, directory: Option<&Path>) -> Option<PathBuf> {
+/// 弹出「另存为」对话框，返回结果通道（非阻塞）。
+///
+/// # 为什么主线程不能在这里阻塞
+///
+/// `rfd` 的对话框是**阻塞式**的：它内部自己跑一个模态消息循环，直到用户做出选择才返回。
+/// 如果把这段代码直接放在 GPUI 的主线程上，主线程就被这个模态循环占住，窗口无法重绘、
+/// 无法响应 —— 用户把焦点切回主窗口时，系统会把它标记为「未响应」。
+///
+/// 因此这里把对话框放到一个独立的命名线程上执行，主线程**立即拿回一个接收端**，
+/// 由 UI 在自己的事件循环里轮询（`view.rs` 的 `pump_dialog`）。调用线程的「等待」
+/// 发生在一个不相关的工作线程上，主线程始终在泵 GPUI 的消息循环。
+///
+/// # 平台注意
+///
+/// Windows 上 `rfd` 会自行初始化 COM 单元，放到独立线程可正常工作。
+/// macOS 上的原生面板要求在主线程弹出；移植到 macOS 时这里需要改走平台的主线程调度，
+/// 不能照搬「换一个线程」的做法。
+pub fn pick_save_path(suggested_name: &str, directory: Option<&Path>) -> mpsc::Receiver<Option<PathBuf>> {
     let suggested_name = suggested_name.to_string();
     let directory = directory.map(Path::to_path_buf);
     let (sender, receiver) = mpsc::channel();
 
-    let spawned = thread::Builder::new()
+    // 把 sender 交给对话框线程；失败就让它随错误一起被丢弃，
+    // 接收端随即「断开」，调用方轮询时会收到 `Disconnected`、按取消处理。
+    if thread::Builder::new()
         .name("ngy-save-dialog".to_string())
         .spawn(move || {
             let mut dialog = rfd::FileDialog::new().set_file_name(&suggested_name);
@@ -340,21 +359,20 @@ pub fn pick_save_path(suggested_name: &str, directory: Option<&Path>) -> Option<
             }
             // 发送失败说明调用方已经不等了（例如窗口在对话框弹出前被关掉），忽略即可。
             let _ = sender.send(dialog.save_file());
-        });
-
-    if spawned.is_err() {
-        // 连对话框线程都创建不出来属于极端情况。这里返回 `None`（等同用户取消），
-        // 让上层走「未保存」分支 —— 比起 panic 或假装保存成功，这是更安全的降级。
-        return None;
+        })
+        .is_err()
+    {
+        // sender 已随 Err 被丢弃，receiver 断开。
     }
 
-    receiver.recv().ok().flatten()
+    receiver
 }
 
-/// 弹出「打开」对话框。返回 `None` 表示用户取消。
+/// 弹出「打开」对话框，返回结果通道（非阻塞）。
 ///
 /// 与 [`pick_save_path`] 走同一套「对话框独立线程 + channel 回传」的方案，
-/// 理由见那一处的说明（`rfd` 的对话框是阻塞的模态循环，留在 UI 线程会把界面冻住）。
+/// 理由见那一处的说明（`rfd` 的对话框是阻塞的模态循环，但跑在独立线程上，
+/// 主线程只拿回接收端、由 UI 在事件循环里轮询，因此界面不会被冻住）。
 /// 这里只多了一个扩展名过滤器。
 ///
 /// # 过滤器的作用与边界
@@ -363,29 +381,24 @@ pub fn pick_save_path(suggested_name: &str, directory: Option<&Path>) -> Option<
 /// （见 `decode/sniff.rs`），所以列表即使不全也不会打不开文件 —— 用户切到「所有文件」
 /// 即可，选中之后照样能正常解码。也正因如此，这里刻意不从解码器注册表推导列表：
 /// 注册表认识它的每一个格式，而这里要列的是「用户机器上常见的那些」。
-///
-/// # 线程要求
-///
-/// 与另存为相同：对话框自己的线程跑消息循环，调用线程会阻塞在 `recv()` 上，
-/// 因此必须在 UI 线程调用（否则拿不到正确的主线程关联）。
-pub fn pick_open_path() -> Option<PathBuf> {
+pub fn pick_open_path() -> mpsc::Receiver<Option<PathBuf>> {
     let (sender, receiver) = mpsc::channel();
 
-    let spawned = thread::Builder::new()
+    // 把 sender 交给对话框线程；失败就让它随错误一起被丢弃，
+    // 接收端随即「断开」，调用方轮询时会收到 `Disconnected`、按取消处理。
+    if thread::Builder::new()
         .name("ngy-open-dialog".to_string())
         .spawn(move || {
             let dialog = rfd::FileDialog::new().add_filter("图片", IMAGE_EXTENSIONS);
             // 发送失败说明调用方已经不等了（例如窗口先被关掉），忽略即可。
             let _ = sender.send(dialog.pick_file());
-        });
-
-    if spawned.is_err() {
-        // 连对话框线程都创建不出来属于极端情况。返回 `None`（等同用户取消），
-        // 让上层什么都不做 —— 比起 panic，这是更安全的降级。
-        return None;
+        })
+        .is_err()
+    {
+        // sender 已随 Err 被丢弃，receiver 断开。
     }
 
-    receiver.recv().ok().flatten()
+    receiver
 }
 
 /// 「打开」对话框里预置的图片扩展名。
@@ -400,11 +413,11 @@ pub(crate) const IMAGE_EXTENSIONS: &[&str] = &[
     "pct", "pic", "xbm", "xpm", "mng", "jng",
 ];
 
-/// 弹出「重命名」对话框（本质是选一个新路径）。同样不能阻塞调用方线程。
+/// 弹出「重命名」对话框（本质是选一个新路径），返回结果通道（非阻塞）。
 ///
 /// 系统没有「重命名」这个独立对话框，重命名用户视角上就是「在同一个文件夹里
 /// 另存为一个新名字」，因此复用 [`pick_save_path`]，并把默认目录设为当前文件所在目录。
-pub fn pick_rename_path(current: &Path) -> Option<PathBuf> {
+pub fn pick_rename_path(current: &Path) -> mpsc::Receiver<Option<PathBuf>> {
     let suggested_name = current
         .file_name()
         .map(|name| name.to_string_lossy().into_owned())

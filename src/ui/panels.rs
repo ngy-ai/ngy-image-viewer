@@ -18,6 +18,7 @@ use gpui_kit::*;
 
 use crate::model::ImageDocument;
 use crate::ui::format::{bytes_text, duration_text, size_text, zoom_text};
+use crate::ui::icons;
 use crate::ui::theme;
 use crate::ui::view::ImageViewerView;
 
@@ -82,6 +83,7 @@ pub fn toolbar(
                 .child(zoom_text(zoom_percent)),
         )
         .child(icon_button(
+            icons::FIT,
             "适应窗口",
             fits,
             editable,
@@ -91,6 +93,7 @@ pub fn toolbar(
             },
         ))
         .child(icon_button(
+            icons::ACTUAL,
             "1:1",
             !fits,
             editable,
@@ -103,39 +106,39 @@ pub fn toolbar(
     let mut right = div().flex().flex_row().items_center().gap_1();
 
     right = right
-        .child(icon_button("←90°", false, editable, {
+        .child(icon_button(icons::ROTATE_CCW, "←90°", false, editable, {
             let view = view.clone();
             move |_, _, cx| update(&view, cx, |this, cx| this.rotate_counter_clockwise(cx))
         }))
-        .child(icon_button("90°→", false, editable, {
+        .child(icon_button(icons::ROTATE_CW, "90°→", false, editable, {
             let view = view.clone();
             move |_, _, cx| update(&view, cx, |this, cx| this.rotate_clockwise(cx))
         }))
-        .child(icon_button("水平翻转", false, editable, {
+        .child(icon_button(icons::FLIP_H, "水平翻转", false, editable, {
             let view = view.clone();
             move |_, _, cx| update(&view, cx, |this, cx| this.flip_horizontal(cx))
         }))
-        .child(icon_button("垂直翻转", false, editable, {
+        .child(icon_button(icons::FLIP_V, "垂直翻转", false, editable, {
             let view = view.clone();
             move |_, _, cx| update(&view, cx, |this, cx| this.flip_vertical(cx))
         }))
-        .child(icon_button("复制", false, editable, {
+        .child(icon_button(icons::COPY, "复制", false, editable, {
             let view = view.clone();
             move |_, _, cx| update(&view, cx, |this, cx| this.copy_to_clipboard(cx))
         }))
-        .child(icon_button("另存为", false, editable, {
+        .child(icon_button(icons::SAVE_AS, "另存为", false, editable, {
             let view = view.clone();
             move |_, _, cx| update(&view, cx, |this, cx| this.save_as(cx))
         }))
-        .child(icon_button("重命名", false, editable, {
+        .child(icon_button(icons::RENAME, "重命名", false, editable, {
             let view = view.clone();
             move |_, _, cx| update(&view, cx, |this, cx| this.rename(cx))
         }))
-        .child(icon_button("删除", false, editable, {
+        .child(icon_button(icons::TRASH, "删除", false, editable, {
             let view = view.clone();
             move |_, _, cx| update(&view, cx, |this, cx| this.delete_to_trash(cx))
         }))
-        .child(icon_button("EXIF", info_open, editable, {
+        .child(icon_button(icons::INFO, "EXIF", info_open, editable, {
             let view = view.clone();
             move |_, _, cx| update(&view, cx, |this, cx| this.toggle_info_panel(cx))
         }));
@@ -162,6 +165,7 @@ pub fn toolbar(
 /// `active` 表示「当前生效的模式」，用主色底提示；`enabled` 为假时降低不透明度
 /// 并且不响应点击 —— 没有打开的图片时，这些按钮点了也没有意义。
 fn icon_button<F>(
+    icon: &'static [u8],
     label: &'static str,
     active: bool,
     enabled: bool,
@@ -185,16 +189,22 @@ where
         theme::text_muted()
     };
 
+    // 图标以 currentColor 描边，由 text_color 着色，自动跟随三态；
+    // 固定 16px 居中，与文字并排。按钮宽度改为自适应（min_w），
+    // 因为加上图标后「适应窗口」这类长标签需要更多横向空间。
     let mut button = div()
         .flex()
         .items_center()
         .justify_center()
-        .w(px(theme::BUTTON_SIZE))
+        .gap(px(4.0))
+        .min_w(px(theme::BUTTON_SIZE))
         .h(px(theme::BUTTON_SIZE))
+        .px(px(6.0))
         .rounded_md()
         .bg(background)
         .text_color(foreground)
         .text_size(px(11.0))
+        .child(svg().data(icon).size(px(16.0)).text_color(foreground))
         .child(label);
 
     if enabled {
