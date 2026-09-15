@@ -154,6 +154,7 @@ impl Display { /* 走 short_reason */ }
 | `gpui_kit::*` 在 `test-support` 下含 GPUI 自己的 `test` 宏 | 测试模块里写 `use super::*` 会遮蔽内置 `#[test]`，报的是 `recursion limit reached while expanding \`#[test]\``，看不出根因（`gpui-kit` 的 lib.rs 里对此有明确说明）。测试模块按需显式导入，别 glob |
 | `window.request_animation_frame()` 只请求**下一帧** | 任何「等平台状态翻面再重绘」的逻辑（如全屏切换）都必须自己跨若干帧重复请求，只请求一次会停在旧样子上，直到用户碰一下鼠标才变 |
 | 绘制闭包能拿到 `window.scale_factor()` 与画布真实尺寸，`new()` / `accept()` 两样都拿不到 | 「打开图片时的初始缩放」这类要同时看两者才能定的状态，让绘制层**就地求值**（`ViewTransform::fitted` / `initial`）就够，不必等视图下一帧 —— 但两处必须调用**同一个纯函数**，各写一份的结果是第一帧与落定后的画面不一致，表现为一次莫名其妙的跳变。`ZoomMode::Pending` 就是为这段空档存在的：它不是缩放模式，而是「还没定」 |
+| 「打开图片后收起界面」只对**启动就带图**成立 | 判据是 `ui/view.rs` 的 `compact_form(has_image, immersive)`：`immersive` 在 `ImageViewerView::new` 里由「命令行有没有图片路径」定死（见 `app.rs`）。从空窗口里用菜单 / 按钮 / 拖入打开的图片**不改界面形态** —— 用户是先开程序再选图，界面忽然少两栏会像出错，想全屏有 F11。谁把它简化回只看 `has_image`，`only_a_double_click_launch_collapses_the_interface` 立刻红 |
 
 ### WIC 的两个运行时约束
 

@@ -175,6 +175,21 @@ pub struct ImageViewerView {
 
     toasts: Vec<Toast>,
 
+    /// 启动时就带着图片路径（即文件管理器里双击了这张图）。
+    ///
+    /// 它只回答一个问题：**打开图片之后要不要把界面收起来**。
+    ///
+    /// - 带路径启动 —— 用户点的是「一张图」，窗口就该是那张图：标题栏不画菜单、
+    ///   底部不画状态栏，纵向空间全给图像；
+    /// - 不带路径启动 —— 用户是「先开程序，再选图」。这时界面是完整的，
+    ///   选完图也必须保持完整：凭空少掉两栏会像是程序出了错，而想要全屏
+    ///   本来就有 F11 这一条明路，不必替他做主。
+    ///
+    /// 启动那一刻定死，之后不再改变：它描述的是「这次会话是怎么开始的」，
+    /// 不是一个随当前文档漂移的状态 —— 否则「双击打开后按 Ctrl+O 换一张」
+    /// 会让界面在两种形态之间跳一下。
+    immersive: bool,
+
     /// 窗口当前是否全屏。**每帧从平台读一次**（见 `refresh_fullscreen`），
     /// 不在切换的那一刻就地翻转：自持的那份会在异步切换落地前与平台打架。
     fullscreen: bool,
@@ -204,7 +219,8 @@ enum PendingDialog {
 }
 
 impl ImageViewerView {
-    pub fn new(cx: &mut Context<Self>) -> Self {
+    /// `immersive`：启动时命令行是否带了图片路径（文件管理器双击）。含义见字段文档。
+    pub fn new(cx: &mut Context<Self>, immersive: bool) -> Self {
         Self {
             document: None,
             surface: None,
@@ -227,6 +243,7 @@ impl ImageViewerView {
             frame_index: 0,
             animation_started: Instant::now(),
             toasts: Vec::new(),
+            immersive,
             fullscreen: false,
             fullscreen_pending: 0,
             reported_first_frame: false,
@@ -1360,11 +1377,16 @@ impl Render for ImageViewerView {
         let area = self.canvas_area(window, &view_handle);
         let stage = Self::stage(area, cx);
 
-        // 有没有打开图片，决定界面「挤不挤」：
-        // - 打开图片（看图模式）→ 标题栏不画菜单、不画底部状态栏，把纵向空间让给图像；
-        //   窗口按钮仍保留在标题栏，所以窗口依旧能移动 / 最小化 / 关闭。
-        // - 没有图片 → 完整界面（菜单 + 状态栏），画布正中给一个「打开图片」按钮。
+        // 有没有打开图片，决定「用不用得上完整界面」。注意它与下面 `compact` 的区别：
+        // 这一位说的是**文档状态**（有没有图可操作），`compact` 说的是**会话形态**。
+        //
+        // - `has_image` → 菜单项可用、状态栏有内容可填；
+        // - `compact` → 收起菜单与状态栏，让纵向空间给图像。只在「启动就带图」
+        //   （文件管理器双击）时为真：那是用户点名要看这一张图。从空窗口里用菜单 /
+        //   按钮 / 拖入打开图片**不改界面形态** —— 用户是先开程序再选图，界面忽然
+        //   少两栏会像是出错；想全屏，F11 是明路。
         let has_image = self.document.is_some();
+        let compact = compact_form(has_image, self.immersive);
 
         let root = div()
             .flex()
@@ -1396,7 +1418,7 @@ impl Render for ImageViewerView {
             let title_bar = menu::title_bar(
                 self.document.as_ref(),
                 self.menu,
-                !has_image,
+                !compact,
                 &view_handle,
                 window,
             );
@@ -1407,16 +1429,16 @@ impl Render for ImageViewerView {
                 self.info_open,
                 &view_handle,
             );
-            // 看图模式下菜单已经不可见，下拉浮层无从展开，给一个空元素占位即可。
-            let menu_layer = if has_image {
+            // 收起形态下菜单标签整段不画，下拉浮层也就无从展开，给一个空元素占位即可。
+            let menu_layer = if compact {
                 div().into_any_element()
             } else {
-                menu::menu_layer(self.menu, self.document.is_some(), &view_handle)
+                menu::menu_layer(self.menu, has_image, &view_handle)
             };
 
             let root = root.child(title_bar).child(toolbar).child(stage);
-            // 看图模式下隐藏底部状态栏（菜单已在标题栏里整段跳过）。
-            let root = if has_image {
+            // 收起形态下不画底部状态栏（菜单已在标题栏里整段跳过）。
+            let root = if compact {
                 root
             } else {
                 root.child(panels::status_bar(self.document.as_ref(), zoom_percent))
@@ -1426,6 +1448,21 @@ impl Render for ImageViewerView {
             root.child(menu_layer).into_any_element()
         }
     }
+}
+
+/// 打开图片后是否把界面收起来（标题栏不画菜单、底部不画状态栏）。
+///
+/// 两个条件缺一不可：
+///
+/// - `has_image` —— 没有图片就没什么可让位的，界面按完整形态画（画布正中是「打开图片」）；
+/// - `immersive` —— **启动时就带着图片路径**（文件管理器双击）。那是用户点名要看这一张图，
+///   界面让位给图像；而「先开程序、再选图」时界面本来就是完整的，选完图也必须完整 ——
+///   凭空少掉两栏会像是程序出错，何况想要全屏还有 F11 这条明路。
+///
+/// 抽成函数是为了让「判据」与「画不画那两栏」共用一个来源：两处各写一遍，
+/// 将来只会改其中一处（与 [`canvas_top_offset`] 同一个理由）。
+fn compact_form(has_image: bool, immersive: bool) -> bool {
+    has_image && immersive
 }
 
 /// 画布在窗口坐标系里的上边界。
@@ -1487,6 +1524,7 @@ mod tests {
     // 会遮蔽内置的 `#[test]`，报的是「recursion limit reached while expanding
     // `#[test]`」这种看不出根因的错。按需显式导入即可。
     use super::canvas_top_offset;
+    use super::compact_form;
     use crate::ui::theme;
 
     /// 全屏下画布上边界归零 —— 与非全屏时相差正好一个「标题栏 + 工具栏」。
@@ -1499,6 +1537,24 @@ mod tests {
         assert_eq!(
             canvas_top_offset(false),
             theme::TITLE_BAR_HEIGHT + theme::TOOLBAR_HEIGHT
+        );
+    }
+
+    /// 只有「启动就带图」才收起界面。四种组合全钉死。
+    ///
+    /// 第二行是用户报过的那个缺陷：从空窗口里用菜单 / 按钮打开图片，界面必须与打开前
+    /// 一样（除了画布里有图）。判据一旦被「顺手」简化回只看 `has_image`，这里立刻红。
+    #[test]
+    fn only_a_double_click_launch_collapses_the_interface() {
+        assert!(compact_form(true, true), "双击图片打开：界面让位给图像");
+        assert!(
+            !compact_form(true, false),
+            "先开程序再选图：界面必须保持完整，全屏交给 F11"
+        );
+        assert!(!compact_form(false, false), "空状态：完整界面");
+        assert!(
+            !compact_form(false, true),
+            "带路径启动但没打开成功：错误提示要配完整界面"
         );
     }
 }

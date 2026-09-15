@@ -172,7 +172,10 @@ pub fn run(options: AppOptions, mut task: Option<OpenTask>) -> anyhow::Result<()
         );
 
         let view = cx.new(|cx| {
-            let mut view = ImageViewerView::new(cx);
+            // 「启动就带图」= 文件管理器双击那条路径。它决定的是**界面形态**：
+            // 带图启动时界面收起菜单与状态栏（详见 `ImageViewerView::immersive`），
+            // 而通过菜单 / 按钮 / 拖入打开的图片不动界面形态。
+            let mut view = ImageViewerView::new(cx, options.path.is_some());
             match prefetched {
                 Some(outcome) => view.apply(outcome),
                 // 还没有结果：把任务交给视图，它会在每次渲染前轮询一次。
