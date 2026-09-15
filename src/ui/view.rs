@@ -33,6 +33,8 @@
 //! 菜单右侧显示的提示也取自同一张表 —— 两处不可能对不上。
 //! 这也意味着**新增一个动作只需要改那一个文件**，这里只会多出一行 `match` 分支。
 
+use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -108,6 +110,17 @@ pub struct ImageViewerView {
     /// 按下只会得到一句「正在读取目录」的提示。
     neighbors_task: Option<NeighborsTask>,
 
+    /// 邻居的预解码结果：路径 → 已解码（尚未上屏）的 `OpenOutcome`。
+    ///
+    /// 切换时若目标路径命中，直接 `accept`，跳过最慢的「读文件 + 解码」，
+    /// 只剩纹理上传，几乎是瞬时切换。键用路径，是因为命中判断拿的就是
+    /// 目标文件的路径。
+    preloaded: HashMap<PathBuf, OpenOutcome>,
+    /// 进行中的邻居预解码任务（上一张 / 下一张）。`neighbors` 就绪后派生，
+    /// 完成后由 `pump_preloads` 把结果收进 `preloaded`。文档一变就整体作废，
+    /// 不该让上一张图的预解码结果被错当成下一张图的邻居。
+    preload_tasks: Option<(Option<OpenTask>, Option<OpenTask>)>,
+
     transform: ViewTransform,
     viewport: ViewportSlot,
     /// 上一次渲染时画布的尺寸，用来判断「窗口变了没有」。
@@ -149,6 +162,8 @@ impl ImageViewerView {
             task: None,
             neighbors: None,
             neighbors_task: None,
+            preloaded: HashMap::new(),
+            preload_tasks: None,
             transform: ViewTransform::default(),
             viewport: ViewportSlot::default(),
             last_viewport: ImageSize::ZERO,
@@ -216,6 +231,13 @@ impl ImageViewerView {
                         self.frame_index = 0;
                         self.animation_started = Instant::now();
                         self.neighbors_task = Some(NeighborsTask::spawn(doc_path));
+                        // 当前文档变了：旧邻居列表、旧预加载都基于上一张图，留着
+                        // 只会让「再按一次方向键」算出错误的邻居。先作废，等这次
+                        // 的目录扫描完成后再预加载新邻居。两条入口（普通打开 /
+                        // 命中预加载）都走这里，所以统一在 `accept` 里复位最稳。
+                        self.neighbors = None;
+                        self.preloaded.clear();
+                        self.preload_tasks = None;
                         trace::step(
                             "view",
                             format!(
@@ -284,6 +306,51 @@ impl ImageViewerView {
         };
         self.neighbors_task = None;
         self.neighbors = Some(neighbors);
+        // 目录就绪：马上开始预解码邻居，下一次切换就能省掉最慢的「读文件 + 解码」。
+        // 首帧仍然不等它 —— 这里只是派发后台任务，不阻塞当前帧。
+        self.spawn_preloads();
+    }
+
+    /// 目录就绪后立刻预解码上一张 / 下一张。
+    ///
+    /// 与 [`crate::open_job::OpenTask`] 同款：解码在独立线程上跑，只做「读文件 +
+    /// 解码」，不含纹理上传（纹理要在有窗口上下文时由 `accept` → `Surface::build` 做）。
+    /// 所以切换命中后只剩上屏，几乎瞬时。
+    fn spawn_preloads(&mut self) {
+        let Some(neighbors) = self.neighbors.as_ref() else {
+            return;
+        };
+        // 邻居结果只交付一次，不该重复派生两批任务。
+        if self.preload_tasks.is_some() {
+            return;
+        }
+        let previous = neighbors.previous.clone().map(OpenTask::spawn);
+        let next = neighbors.next.clone().map(OpenTask::spawn);
+        self.preload_tasks = Some((previous, next));
+    }
+
+    /// 把后台预解码的结果收进缓存（与 `pump_task` 同一条时序约定：
+    /// 结果只在渲染循环里被取回，且取一次即止）。
+    fn pump_preloads(&mut self) {
+        let Some(tasks) = self.preload_tasks.as_mut() else {
+            return;
+        };
+        let mut all_done = true;
+        // 上一张 / 下一张各一个槽，完成的取出进缓存、清掉槽位。
+        for slot in [&mut tasks.0, &mut tasks.1] {
+            if let Some(task) = slot.as_mut() {
+                if let Some(outcome) = task.poll() {
+                    // 按路径索引：切换时拿目标路径来这里查，命中即用。
+                    self.preloaded.insert(outcome.path.clone(), outcome);
+                    *slot = None;
+                } else {
+                    all_done = false;
+                }
+            }
+        }
+        if all_done {
+            self.preload_tasks = None;
+        }
     }
 
     // ---- 供面板调用的动作 ----
@@ -583,6 +650,10 @@ impl ImageViewerView {
                 self.document = None;
                 self.surface = None;
                 self.phase = Phase::Empty;
+                // 邻居与预加载都基于这张已删除的图，留着既错又占内存。
+                self.neighbors = None;
+                self.preloaded.clear();
+                self.preload_tasks = None;
                 self.push_toast("已移入回收站（可从回收站还原）", ToastKind::Success);
             }
             Err(error) => self.push_toast(error.user_message(), ToastKind::Error),
@@ -615,6 +686,13 @@ impl ImageViewerView {
             self.push_toast("目录里没有其他图片", ToastKind::Info);
             return;
         };
+        // 命中预加载：直接接管，省掉最慢的「读文件 + 解码」这段。
+        // 文档变了，`accept` 会清掉旧邻居与旧预加载、重新扫描并预加载新邻居。
+        if let Some(outcome) = self.preloaded.remove(&path) {
+            trace::step("view", format!("命中预加载，直接挂载：{}", path.display()));
+            self.accept(outcome);
+            return;
+        }
         self.open_path(path, cx);
     }
 
@@ -664,7 +742,7 @@ impl ImageViewerView {
             .as_ref()
             .map(|surface| surface.is_animated())
             .unwrap_or(false);
-        animating || !self.toasts.is_empty() || self.task.is_some() || self.neighbors_task.is_some()
+        animating || !self.toasts.is_empty() || self.task.is_some() || self.neighbors_task.is_some() || self.preload_tasks.is_some()
     }
 
     // ---- 交互 ----
@@ -930,6 +1008,7 @@ impl Render for ImageViewerView {
         // 1. 先把后台结果收回来 —— 这一帧就能显示图像，而不是等到下一帧。
         self.pump_task();
         self.pump_neighbors();
+        self.pump_preloads();
 
         // 2. 画布尺寸可能刚刚变化（首帧时它还是零），据此重算「适应窗口」。
         let measured = self.viewport.get();
