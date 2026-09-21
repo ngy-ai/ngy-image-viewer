@@ -200,7 +200,10 @@ fn menu_item(
     preference: Preference,
     view: &Entity<ImageViewerView>,
 ) -> AnyElement {
-    let enabled = !command.needs_image() || has_image;
+    // 两种灰是有区别的：`is_available` 假 = 这台机器上根本做不到（跨平台限制），
+    // 不会因为打开一张图而改变；`needs_image` 真且没有图 = 先打开一张图就能用。
+    // 混成一个判断会让用户分不清该「先开一张图」还是「这事在这台机器上没戏」。
+    let enabled = command.is_available() && (!command.needs_image() || has_image);
     // 皮肤三项是互斥的单选，当前生效的那个要有个「已选中」的标记。
     // 用文字标记而不是一个勾号字形：那些码位不保证在系统字体里存在，
     // 缺字时用户看到的是豆腐块（与 `maximize_glyph` 同一个理由）。

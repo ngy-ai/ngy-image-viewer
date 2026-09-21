@@ -50,6 +50,8 @@ pub enum Command {
     SkinDark,
     /// 皮肤：固定浅色。
     SkinLight,
+    /// 文件关联：挑出双击时要用本程序打开的格式。
+    AssociateFormats,
     Quit,
 }
 
@@ -77,26 +79,45 @@ impl Command {
             Self::SkinFollowSystem => "跟随系统",
             Self::SkinDark => "深色",
             Self::SkinLight => "浅色",
+            Self::AssociateFormats => "设置关联格式…",
             Self::Quit => "退出",
         }
     }
 
     /// 没有打开图片时，这个动作是否还有意义。
     ///
-    /// 「打开」「全屏」「皮肤」「退出」不依赖当前文档；其余动作都作用在图像上，没有图的时候
+    /// 「打开」「全屏」「皮肤」「设置关联格式」「退出」不依赖当前文档；其余动作都作用在图像上，没有图的时候
     /// 点它们只会静默地什么都不发生 —— 那比显示成灰色更让人困惑，因此菜单里这些项
     /// 会被渲染成禁用态。键盘入口在视图里用同一个判断挡一次，两条入口不会走偏。
     pub fn needs_image(self) -> bool {
         !matches!(
             self,
             // 皮肤是「窗口长什么样」，与画布内容无关：空状态下一样该能改。
+            // 文件关联改的是「这个程序认识哪些文件」，同样与当前文档无关。
             Self::Open
                 | Self::ToggleFullscreen
                 | Self::SkinFollowSystem
                 | Self::SkinDark
                 | Self::SkinLight
+                | Self::AssociateFormats
                 | Self::Quit
         )
+    }
+
+    /// 当前平台上这个动作做不做得到。
+    ///
+    /// 与 [`needs_image`](Self::needs_image) 分开：那个问的是「现在有没有可作用的对象」，
+    /// 这个问的是「这台机器上这件事根本做不做得到」。前者会随文档状态变化，
+    /// 后者在进程的生命周期里是恒定的 —— 混成一个判断会让菜单在两种灰之间失去区别。
+    ///
+    /// 目前只有文件关联受限：它读写 Windows 注册表，别的系统还没有实现
+    /// （macOS 要在打包时声明文档类型，Linux 要写 `.desktop` + `xdg-mime`）。
+    /// 做不到的项置灰，比点下去再弹一句「做不到」早一步告诉用户。
+    pub fn is_available(self) -> bool {
+        match self {
+            Self::AssociateFormats => crate::fs_ops::associations::is_supported(),
+            _ => true,
+        }
     }
 
     /// 菜单右侧的快捷键提示；没有绑定按键时返回空串。
@@ -163,8 +184,12 @@ pub struct Menu {
 
 /// 菜单栏的结构。
 ///
-/// 只有三个菜单，且每一项都真的能执行：这一行占的是图像的纵向空间，
+/// 四个菜单，每一项都真的能执行：这一行占的是图像的纵向空间，
 /// 塞进「帮助」却点不出帮助内容（本产品没有独立窗口去承载）只会让这条栏变得更廉价。
+///
+/// 分工按「这个动作作用在什么上」划：**文件 / 编辑 / 视图** 作用于当前这张图，
+/// **工具** 作用于程序自身（现在只有文件关联）。把程序设置混进「文件」菜单会让
+/// 那个菜单变得不可预测 —— 里面每一项都该是「对现在这张图做点什么」。
 pub const MENUS: &[Menu] = &[
     Menu {
         label: "文件",
@@ -206,6 +231,10 @@ pub const MENUS: &[Menu] = &[
             Entry::Separator,
             Entry::Item(Command::ToggleFullscreen),
         ],
+    },
+    Menu {
+        label: "工具",
+        entries: &[Entry::Item(Command::AssociateFormats)],
     },
 ];
 
@@ -475,12 +504,12 @@ mod tests {
         }
 
         // 反向：所有动作里只有这些没有快捷键 —— 前两个要弹对话框 / 有破坏性，
-        // 「退出」交给系统的 Alt+F4，皮肤三项是低频的一次性设置
-        // （系统改了主题自己会跟随，不需要一个按键来切）。
+        // 「退出」交给系统的 Alt+F4，皮肤三项与文件关联是低频的一次性设置
+        // （系统改了主题自己会跟随，没必要时时按；文件关联更是装完设一次就不动）。
         // 这条断言的作用是把「哪些动作没有快捷键」变成一个需要显式改动的决定。
         //
         // 顺序按**菜单里出现的先后**（`menu_commands` 逐菜单收集）：「退出」在
-        // 「文件」菜单末尾，所以排在「视图」菜单里的皮肤三项之前。
+        // 「文件」菜单末尾，所以排在「视图」菜单里的皮肤三项与「工具」菜单的文件关联之前。
         let without_shortcut: Vec<Command> = menu_commands()
             .into_iter()
             .filter(|command| command.shortcut_label().is_empty())
@@ -493,7 +522,8 @@ mod tests {
                 Command::Quit,
                 Command::SkinFollowSystem,
                 Command::SkinDark,
-                Command::SkinLight
+                Command::SkinLight,
+                Command::AssociateFormats
             ]
         );
     }
@@ -510,9 +540,27 @@ mod tests {
                     | Command::SkinFollowSystem
                     | Command::SkinDark
                     | Command::SkinLight
+                    | Command::AssociateFormats
                     | Command::Quit
             );
             assert_eq!(command.needs_image(), expected, "{command:?}");
+        }
+    }
+
+    /// 「本平台做不做得到」是独立的一维：它不随文档状态变化，
+    /// 因此除了明确受限的那一项，其余动作在任何平台都必须可用。
+    ///
+    /// 这条断言防的是「顺手把 is_available 写成 needs_image 的别名」——
+    /// 那会让菜单在两种灰之间失去区别，用户无从判断「先打开一张图就行」
+    /// 还是「这件事在这台机器上永远做不到」。
+    #[test]
+    fn platform_availability_is_separate_from_the_document_state() {
+        for command in menu_commands() {
+            let expected = match command {
+                Command::AssociateFormats => crate::fs_ops::associations::is_supported(),
+                _ => true,
+            };
+            assert_eq!(command.is_available(), expected, "{command:?}");
         }
     }
 
@@ -570,7 +618,7 @@ mod tests {
 
     #[test]
     fn menu_bar_is_shallow_and_correctly_grouped() {
-        assert_eq!(MENUS.len(), 3);
+        assert_eq!(MENUS.len(), 4);
         for menu in MENUS {
             assert!(!menu.label.is_empty());
             assert!(!menu.entries.is_empty(), "{} 菜单是空的", menu.label);
@@ -587,6 +635,32 @@ mod tests {
             }
         }
         let labels: Vec<&str> = MENUS.iter().map(|menu| menu.label).collect();
-        assert_eq!(labels, vec!["文件", "编辑", "视图"]);
+        assert_eq!(labels, vec!["文件", "编辑", "视图", "工具"]);
+    }
+
+    /// 「工具」菜单只放程序自身的设置，不放作用于当前图片的动作。
+    ///
+    /// 这条断言把菜单的**语义归属**钉住：一条命令该进哪个菜单是设计决定，
+    /// 不该因为「顺手」而漂移 —— 用户找「双击用什么打开」时，
+    /// 会去「工具/设置」，不会去「视图」。
+    #[test]
+    fn the_tools_menu_holds_program_settings_only() {
+        let tools = MENUS
+            .iter()
+            .find(|menu| menu.label == "工具")
+            .expect("应当有一个「工具」菜单");
+        let items: Vec<Command> = tools
+            .entries
+            .iter()
+            .filter_map(|entry| match entry {
+                Entry::Item(command) => Some(*command),
+                Entry::Separator => None,
+            })
+            .collect();
+        assert_eq!(items, vec![Command::AssociateFormats]);
+        // 程序设置与文档无关 —— 空窗口下它也必须能点。
+        for command in items {
+            assert!(!command.needs_image(), "{command:?} 不该要求先打开图片");
+        }
     }
 }

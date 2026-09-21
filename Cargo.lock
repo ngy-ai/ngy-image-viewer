@@ -4377,6 +4377,7 @@ dependencies = [
  "rfd",
  "trash",
  "windows 0.62.2",
+ "winreg",
  "winresource",
 ]
 

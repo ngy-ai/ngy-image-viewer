@@ -97,24 +97,31 @@ fn decode_path(src: &Path, limits: &DecodeLimits) -> DecodeResult<ImageData> {
     // 颜色表：键 → (R, G, B, A)。遇到无法识别的颜色直接拒绝，避免交付错图。
     let mut palette: HashMap<String, (u8, u8, u8, u8)> = HashMap::with_capacity(num_colors);
     for line in &strings[1..1 + num_colors] {
-        let tokens: Vec<&str> = line.split_whitespace().collect();
-        if tokens.len() < 2 {
-            return Err(DecodeError::corrupt("XPM 颜色行格式不正确"));
-        }
-        let key = tokens[0].to_string();
-        // 类型标记 c/m/g/s 之后才是真正的颜色说明；过滤掉键与类型标记，取最后一个候选。
-        let is_type_marker =
-            |t: &&str| t.eq_ignore_ascii_case("c") || t.eq_ignore_ascii_case("m") || t.eq_ignore_ascii_case("g") || t.eq_ignore_ascii_case("s");
+        // 键是**行首的 cpp 个字符**，不是第一个空白分隔的词 —— 空格本身就是合法键。
+        // `"  c None"`（以空格为键、意义为透明）是很多编辑器生成 XPM 时的标准写法，
+        // 用 `split_whitespace()` 取词会把这种键整个吃掉，像素行里就永远查不到它。
+        let Some((key, rest)) = line.split_at_checked(cpp) else {
+            return Err(DecodeError::corrupt(format!(
+                "XPM 颜色行的键长度不足（需要 {cpp} 个字符）：{line}"
+            )));
+        };
+        let tokens: Vec<&str> = rest.split_whitespace().collect();
+        // 类型标记 c/m/g/s 之后才是真正的颜色说明；过滤掉类型标记，取最后一个候选。
+        let is_type_marker = |t: &&str| {
+            t.eq_ignore_ascii_case("c")
+                || t.eq_ignore_ascii_case("m")
+                || t.eq_ignore_ascii_case("g")
+                || t.eq_ignore_ascii_case("s")
+        };
         let color = tokens
             .iter()
-            .skip(1)
             .filter(|t| !is_type_marker(t))
             .last()
             .copied()
             .ok_or_else(|| DecodeError::corrupt(format!("XPM 颜色行缺少有效的颜色说明：{line}")))?;
 
         if color.eq_ignore_ascii_case("none") || color.eq_ignore_ascii_case("transparent") {
-            palette.insert(key, (0, 0, 0, 0));
+            palette.insert(key.to_string(), (0, 0, 0, 0));
         } else {
             let rgb = parse_color(color).ok_or_else(|| {
                 DecodeError::unsupported(
@@ -122,7 +129,7 @@ fn decode_path(src: &Path, limits: &DecodeLimits) -> DecodeResult<ImageData> {
                     format!("XPM 包含无法识别的颜色「{color}」，请改用 #RRGGBB 等写法或常见颜色名"),
                 )
             })?;
-            palette.insert(key, (rgb.0, rgb.1, rgb.2, 255));
+            palette.insert(key.to_string(), (rgb.0, rgb.1, rgb.2, 255));
         }
     }
 
@@ -311,6 +318,29 @@ mod tests {
         let xpm = build_xpm(1, 1, &[("a", "chartreuseXX")], &["a"]);
         let err = decode_bytes_for_test(&xpm).expect_err("未知颜色应被拒绝");
         assert!(matches!(err, DecodeError::Unsupported { .. }));
+    }
+
+    #[test]
+    fn a_space_is_a_valid_palette_key() {
+        // `"  c none"`（空格做键、意义为透明）是大量 XPM 生成器的默认写法。
+        // 键必须按 cpp 从**行首**切，不能靠 `split_whitespace` 取词 —— 那会把空格键吃掉。
+        let xpm = build_xpm(2, 2, &[(" ", "none"), ("a", "#FF0000")], &["a ", " a"]);
+        let data = decode_bytes_for_test(&xpm).expect("空格键的 XPM 应解出");
+        let px = &data.primary().rgba8;
+        assert_eq!(&px[0..4], &[255, 0, 0, 255], "像素(0,0) 应红");
+        assert_eq!(&px[4..8], &[0, 0, 0, 0], "像素(1,0) 应透明");
+        assert_eq!(&px[8..12], &[0, 0, 0, 0], "像素(0,1) 应透明");
+        assert_eq!(&px[12..16], &[255, 0, 0, 255], "像素(1,1) 应红");
+    }
+
+    #[test]
+    fn a_multi_char_key_still_parses() {
+        // cpp = 2：键是行首两个字符，后面才是类型标记与颜色。
+        let xpm = build_xpm(2, 1, &[("..", "#00FF00"), ("++", "#0000FF")], &["..++"]);
+        let data = decode_bytes_for_test(&xpm).expect("cpp=2 的 XPM 应解出");
+        let px = &data.primary().rgba8;
+        assert_eq!(&px[0..4], &[0, 255, 0, 255], "像素(0,0) 应绿");
+        assert_eq!(&px[4..8], &[0, 0, 255, 255], "像素(1,0) 应蓝");
     }
 
     fn decode_bytes_for_test(xpm: &str) -> DecodeResult<ImageData> {

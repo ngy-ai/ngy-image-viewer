@@ -43,6 +43,7 @@ use gpui_kit::*;
 
 use crate::decode::{ImageData, orientation};
 use crate::fs_ops::Preference;
+use crate::fs_ops::associations;
 use crate::fs_ops::file_ops::{self, Bitmap};
 use crate::fs_ops::neighbors::NeighborsTask;
 use crate::input::{PanGesture, zoom_factor_from_lines, zoom_factor_from_pixels};
@@ -53,7 +54,7 @@ use crate::render::{Surface, ViewportConfig, ViewportSlot, viewport};
 use crate::trace;
 use crate::ui::command::{Command, command_for_keystroke};
 use crate::ui::theme::{self, Skin};
-use crate::ui::{menu, panels};
+use crate::ui::{assoc, menu, panels};
 
 /// 浮层的类型，决定配色。
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -211,6 +212,19 @@ pub struct ImageViewerView {
     /// 手动选了深色之后，这个偏好在本次会话里就一直压着系统值，
     /// 直到用户重新选「跟随系统」。
     preference: Preference,
+
+    /// 「设置关联格式」浮层。`None` = 没有打开。
+    ///
+    /// 打开时才去读一次注册表（见 [`Self::open_assoc_panel`]），之后内容就固定下来，
+    /// 每次勾选只更新对应的那一项 —— 面板开着的时候别人改关联的概率极低，
+    /// 而每帧重读注册表意味着渲染循环里有 IO，那是这一层最不该做的事。
+    assoc_panel: Option<AssocPanel>,
+}
+
+/// 「设置关联格式」浮层的内容。
+struct AssocPanel {
+    /// 与 [`crate::fs_ops::file_ops::IMAGE_EXTENSIONS`] 同序，下标即勾选时的定位键。
+    entries: Vec<crate::fs_ops::Association>,
 }
 
 /// 正在等待用户通过系统对话框做选择的一项。
@@ -265,6 +279,7 @@ impl ImageViewerView {
             // 而且会给「视图的偏好」与「平台已经切过去的外观」制造一个可能不一致的
             // 中间态。默认值必须与 `Preference::default()` 一致。
             preference: Preference::default(),
+            assoc_panel: None,
         }
     }
 
@@ -687,7 +702,10 @@ impl ImageViewerView {
 
         // 没有打开图片时，作用在图像上的动作无处施加。菜单里这些项已经是禁用态，
         // 这里再挡一次是给键盘入口准备的同一个判断。
-        if command.needs_image() && self.document.is_none() {
+        //
+        // 「本平台根本做不到」是另一维，同样在这里挡一次：两条入口共用一份判断，
+        // 不会出现「菜单里点不动、键盘却能触发」这种只在一边漏掉的情况。
+        if (command.needs_image() && self.document.is_none()) || !command.is_available() {
             // 上面那行已经可能把菜单收起来了，所以这里仍然要重绘一次。
             cx.notify();
             return;
@@ -719,12 +737,281 @@ impl ImageViewerView {
             Command::SkinLight => {
                 self.set_preference(Preference::Fixed(theme::Polarity::Light), cx)
             }
+            Command::AssociateFormats => self.open_assoc_panel(cx),
             // 退出整个应用而不是关掉这个窗口：本程序只有这一个窗口，
             // 两者在当前实现下等价，但「退出」是用户按下菜单项时的心智模型。
             Command::Quit => cx.quit(),
         }
 
         cx.notify();
+    }
+
+    /// 打开「设置关联格式」浮层。
+    ///
+    /// 打开的那一刻读一次注册表：58 个扩展名、上百次键查询。实测在几毫秒量级，
+    /// 而它是用户主动触发的一次性动作 —— 不在这条路径上的「双击即见图」不受影响。
+    /// 读完之后面板的内容就固定了，渲染循环里一次 IO 都不做（见 [`AssocPanel`]）。
+    fn open_assoc_panel(&mut self, cx: &mut Context<Self>) {
+        // 面板已经开着：再点一次菜单项不该把它关掉，那样「点两下就没了」。
+        if self.assoc_panel.is_some() {
+            return;
+        }
+        // 系统对话框正在等结果：不叠第二个模态层，否则两层浮层会互相盖。
+        if self.pending_dialog.is_some() {
+            self.push_toast(
+                "有文件对话框还开着，先把它处理完再设置关联。",
+                ToastKind::Info,
+            );
+            return;
+        }
+
+        let started = Instant::now();
+        match associations::read_all() {
+            Ok(entries) => {
+                trace::step(
+                    "assoc",
+                    format!(
+                        "读取关联现状：{} 个格式，耗时 {:?}",
+                        entries.len(),
+                        started.elapsed()
+                    ),
+                );
+                self.assoc_panel = Some(AssocPanel { entries });
+            }
+            Err(error) => {
+                // 不支持关联的平台走到这里（菜单项已经置灰，但键盘或将来新增的入口
+                // 有可能绕过），以及注册表读不动的情况。两种都要说清原因。
+                trace::fail("assoc", error.short_reason());
+                self.push_toast(error.user_message(), ToastKind::Warning);
+            }
+        }
+        cx.notify();
+    }
+
+    /// 关掉「设置关联格式」浮层。
+    ///
+    /// 带一个用不到的 `window` 参数，是为了能作为函数指针交给
+    /// [`crate::ui::assoc`] 里的按钮 —— 三个按钮的动作签名一致，调用处就不必分情况。
+    pub fn close_assoc_panel(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+        self.assoc_panel = None;
+        cx.notify();
+    }
+
+    /// 切换一个格式的关联状态（点一下方块）。
+    pub fn toggle_association(&mut self, index: usize, cx: &mut Context<Self>) {
+        let Some((extension, current)) = self
+            .assoc_panel
+            .as_ref()
+            .and_then(|panel| panel.entries.get(index))
+            .map(|entry| (entry.extension.clone(), entry.state))
+        else {
+            return;
+        };
+
+        let associated = !current.is_marked();
+        match self.apply_association(&extension, associated) {
+            Ok(state) => trace::step(
+                "assoc",
+                format!("{}.{extension} → {}", if associated { "关联" } else { "取消" }, state.label()),
+            ),
+            Err(error) => {
+                trace::fail("assoc", error.short_reason());
+                self.push_toast(error.user_message(), ToastKind::Error);
+            }
+        }
+        cx.notify();
+    }
+
+    /// 「全部关联」：把所有还没关联的格式一次写完。
+    pub fn associate_all(&mut self, cx: &mut Context<Self>) {
+        self.write_all_associations(true, cx);
+    }
+
+    /// 「全部取消」：把所有已登记的格式撤掉。
+    pub fn disassociate_all(&mut self, cx: &mut Context<Self>) {
+        self.write_all_associations(false, cx);
+    }
+
+    /// 「设为默认…」：把本程序送进系统「默认应用」页并定位到它。
+    ///
+    /// UserChoice 那一层程序改不动 —— 它带哈希校验，且自 2024 年 2 月累积更新起
+    /// 由内核驱动 `UCPD.sys` 拦截写入（本机实测 `.png` 就落在 WPS 手里）。Windows
+    /// 只认用户在系统 UI 里的选择，所以能做的就是把用户**直接送到**那一页并翻到
+    /// 本程序，一次点击覆盖全部格式 —— 而不是让他自己去「设置」里翻。
+    ///
+    /// 跳转前先把候选格式登记齐（幂等）：设置页里本程序那一页只列已登记的格式，
+    /// 漏登记的格式即使点了「设置默认值」也切不过来。
+    pub fn make_default(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+        let missing: Vec<String> = match self.assoc_panel.as_ref() {
+            Some(panel) => panel
+                .entries
+                .iter()
+                .filter(|entry| !entry.state.is_marked())
+                .map(|entry| entry.extension.clone())
+                .collect(),
+            // 面板没开就不可能点到这个按钮；真到了这里也是无事可做。
+            None => return,
+        };
+
+        let mut failed = 0usize;
+        for extension in &missing {
+            if let Err(error) = self.apply_association(extension, true) {
+                trace::fail("assoc", error.short_reason());
+                failed += 1;
+            }
+        }
+
+        match associations::open_defaults_settings() {
+            Ok(()) => {
+                trace::step(
+                    "assoc",
+                    format!(
+                        "已打开系统「默认应用」设置页（本次补登记 {} 个，失败 {failed} 个）",
+                        missing.len()
+                    ),
+                );
+                let text = if failed > 0 {
+                    format!(
+                        "已打开系统「默认应用」设置页：找到本程序，点「设置默认值」即可一次切换\
+                         全部格式。另有 {failed} 个格式登记失败（可能被安全软件保护）。"
+                    )
+                } else {
+                    "已打开系统「默认应用」设置页：找到本程序，点「设置默认值」即可一次切换\
+                     全部格式。"
+                        .to_string()
+                };
+                self.push_toast(
+                    text,
+                    if failed > 0 {
+                        ToastKind::Warning
+                    } else {
+                        ToastKind::Info
+                    },
+                );
+            }
+            Err(error) => {
+                trace::fail("assoc", error.short_reason());
+                self.push_toast(error.user_message(), ToastKind::Error);
+            }
+        }
+        cx.notify();
+    }
+
+    /// 批量写入，并汇总成**一条**提示。
+    ///
+    /// 逐个弹提示是不行的：58 个格式全失败会得到 58 条 toast，把屏幕刷满而
+    /// 什么也没说清。这里的口径是「做成了多少、还剩多少要用户自己动手」。
+    fn write_all_associations(&mut self, associated: bool, cx: &mut Context<Self>) {
+        let targets: Vec<String> = match self.assoc_panel.as_ref() {
+            Some(panel) => panel
+                .entries
+                .iter()
+                // 只处理状态会真正变化的那批：已经关联的再关联一次是白写注册表。
+                .filter(|entry| entry.state.is_marked() != associated)
+                .map(|entry| entry.extension.clone())
+                .collect(),
+            None => return,
+        };
+
+        if targets.is_empty() {
+            self.push_toast(
+                if associated {
+                    "所有格式都已关联"
+                } else {
+                    "没有需要取消的关联"
+                },
+                ToastKind::Info,
+            );
+            cx.notify();
+            return;
+        }
+
+        let started = Instant::now();
+        let mut failed = 0usize;
+        for extension in &targets {
+            if let Err(error) = self.apply_association(extension, associated) {
+                trace::fail("assoc", error.short_reason());
+                failed += 1;
+            }
+        }
+        let elapsed = started.elapsed();
+
+        let (linked, registered) = self.assoc_counts();
+        trace::step(
+            "assoc",
+            format!(
+                "批量{}：目标 {} 个，失败 {failed} 个，耗时 {:?}；现状 已关联 {linked} 已登记 {registered}",
+                if associated { "关联" } else { "取消关联" },
+                targets.len(),
+                elapsed,
+            ),
+        );
+
+        let done = targets.len() - failed;
+        let text = if failed > 0 {
+            format!(
+                "{done} 个已处理，{failed} 个写入失败（可能被安全软件保护），可以重试。"
+            )
+        } else if associated && registered > 0 {
+            format!(
+                "已关联 {done} 个格式。另有 {registered} 个已被系统默认应用占用，\
+                 点「设为默认…」到系统设置里一次性切过来。"
+            )
+        } else if associated {
+            format!("已关联 {done} 个格式，双击这些格式的图片会用本程序打开。")
+        } else {
+            format!("已取消 {done} 个格式的关联。")
+        };
+
+        self.push_toast(
+            text,
+            if failed > 0 {
+                ToastKind::Warning
+            } else {
+                ToastKind::Success
+            },
+        );
+        cx.notify();
+    }
+
+    /// 写入一条关联并把结果同步回面板。
+    ///
+    /// **状态以写入之后重新读到的为准**，不是以「写成功了」为准：注册表写进去
+    /// 不等于系统会用它（UserChoice 会压住我们），所以这里记下的是真实处境。
+    fn apply_association(
+        &mut self,
+        extension: &str,
+        associated: bool,
+    ) -> Result<associations::AssocState, associations::AssocError> {
+        let state = associations::set(extension, associated)?;
+        if let Some(panel) = self.assoc_panel.as_mut() {
+            if let Some(entry) = panel
+                .entries
+                .iter_mut()
+                .find(|entry| entry.extension == extension)
+            {
+                entry.state = state;
+            }
+        }
+        Ok(state)
+    }
+
+    /// 面板里「已关联」「已登记」各有多少个。
+    fn assoc_counts(&self) -> (usize, usize) {
+        let Some(panel) = self.assoc_panel.as_ref() else {
+            return (0, 0);
+        };
+        let linked = panel
+            .entries
+            .iter()
+            .filter(|entry| entry.state == associations::AssocState::Default)
+            .count();
+        let registered = panel
+            .entries
+            .iter()
+            .filter(|entry| entry.state == associations::AssocState::Registered)
+            .count();
+        (linked, registered)
     }
 
     /// 「打开…」：走系统文件对话框，再复用「拖入文件」那条路径。
@@ -1069,8 +1356,10 @@ impl ImageViewerView {
     /// 也就不会出现「一个入口能用、另一个漏了某步」的不一致。
     fn toggle_fullscreen(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         // 全屏时不画下拉浮层，留着这个下标只会让退出全屏的瞬间冒出一个
-        // 「本来就开着」的菜单。
+        // 「本来就开着」的菜单。设置面板同理 —— 它是模态的，压在「只剩图像」
+        // 这个语义上说不通。
         self.menu = None;
+        self.assoc_panel = None;
         window.toggle_fullscreen();
         self.fullscreen_pending = FULLSCREEN_SETTLE_FRAMES;
         cx.notify();
@@ -1133,14 +1422,22 @@ impl ImageViewerView {
     fn on_key_down(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         let key = event.keystroke.key.as_str();
 
-        // ESC 有两条含义，取决于菜单是否展开：先收起菜单，再谈退出全屏。
+        // ESC 有三条含义，按「最外面那一层」依次收起：设置面板 → 展开的菜单 → 退出全屏。
         // 顺序反过来的话，开着菜单按 ESC 会连带退出全屏，用户会以为按错了键。
         if key == "escape" {
-            if self.menu.is_some() {
+            if self.assoc_panel.is_some() {
+                self.close_assoc_panel(window, cx);
+            } else if self.menu.is_some() {
                 self.close_menu(cx);
             } else {
                 self.toggle_fullscreen(window, cx);
             }
+            return;
+        }
+
+        // 设置面板是模态的：它盖住的图像看不见，这时按 R / V 会「生效了却没反应」，
+        // 比什么都没发生更让人困惑。面板期间只认 ESC。
+        if self.assoc_panel.is_some() {
             return;
         }
 
@@ -1490,6 +1787,13 @@ impl Render for ImageViewerView {
         let area = self.canvas_area(skin, window, &view_handle);
         let stage = Self::stage(area, cx);
 
+        // 「设置关联格式」浮层。与下拉菜单同理：由根容器的最后一个孩子绘制
+        // （GPUI 按树序绘制，后画的才盖得住画布），所以下面要把它接在菜单浮层之后。
+        let assoc_layer = match self.assoc_panel.as_ref() {
+            Some(panel) => assoc::panel(skin, &panel.entries, &view_handle),
+            None => div().into_any_element(),
+        };
+
         // 有没有打开图片，决定「用不用得上完整界面」。注意它与下面 `compact` 的区别：
         // 这一位说的是**文档状态**（有没有图可操作），`compact` 说的是**会话形态**。
         //
@@ -1558,9 +1862,13 @@ impl Render for ImageViewerView {
             } else {
                 root.child(panels::status_bar(skin, self.document.as_ref(), zoom_percent))
             };
-            // 下拉浮层必须是最后一个孩子：GPUI 按树序绘制，后画的盖住先画的。
+            // 下拉浮层与设置浮层必须是最后两个孩子：GPUI 按树序绘制，后画的盖住先画的。
             // 放在标题栏里（它的逻辑归属处）会被后画的画布整块盖住。
-            root.child(menu_layer).into_any_element()
+            //
+            // 顺序也不能反：设置面板是模态的，它必须压在已经展开的菜单之上。
+            root.child(menu_layer)
+                .child(assoc_layer)
+                .into_any_element()
         }
     }
 }

@@ -31,11 +31,21 @@
 //! 「哪种扩展名可以另存为」由 [`crate::decode::ImageFormat::can_encode`] 决定，
 //! 本层不另立一套判断。这样做的好处是：解码层新增 / 收回某个编码器时，
 //! 另存为的可用格式会自动跟着变，不会出现「UI 说能存、编码时才报错」的错配。
+//!
+//! # 文件关联的最后一步在系统 UI 里，不在注册表里
+//!
+//! [`associations`] 能把本程序登记成候选打开方式（「打开方式」列表 + 系统「默认应用」
+//! 的候选里都有它），但**改不动**系统已经记住的默认程序：那份选择存在
+//! `FileExts\.<ext>\UserChoice`，受哈希与内核驱动保护。要真正成为默认，只能把用户送到
+//! 系统「默认应用」页 —— [`associations::open_defaults_settings`] 就是这一步，
+//! 它同时把本程序登记齐，好让那一页列出全部候选格式。理由见该模块的文档。
 
+pub mod associations;
 pub mod file_ops;
 pub mod neighbors;
 pub mod settings;
 
+pub use associations::{AssocError, AssocState, Association};
 pub use neighbors::{Neighbors, NeighborsTask};
 pub use settings::Preference;
 pub use file_ops::{

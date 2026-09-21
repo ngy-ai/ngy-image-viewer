@@ -152,6 +152,15 @@ pub struct Skin {
     /// 但浅色下的两个值必须**比画布暗**（深色下是比画布亮）——
     /// 方向反了棋盘格就消失了，而半透明 PNG 会看起来像纯色块。
     pub checker: (Hsla, Hsla),
+    /// 模态浮层下面那层遮罩。
+    ///
+    /// 刻意用**近黑**而不是画布色：模态浮层要表达「下面那层先放一放」，
+    /// 靠的就是把背景压暗。用画布色做遮罩等于什么都没做 —— 它和背景同色，
+    /// 混合出来还是原来的颜色（这个坑实际踩过一次）。
+    ///
+    /// 两套皮肤的差别在强度：浅色底上 30% 就够了（再多会显得脏），
+    /// 深色底本来就近黑，需要更高的不透明度才看得出「有一层东西盖在上面」。
+    pub scrim: Hsla,
 }
 
 /// 深色皮肤。
@@ -180,6 +189,12 @@ pub static DARK: LazyLock<Skin> = LazyLock::new(|| Skin {
     info: rgb(0x60A5FA).into(),
     border: rgb(0x262A31).into(),
     checker: (rgb(0x1A1C21).into(), rgb(0x141519).into()),
+    scrim: Hsla {
+        h: 0.0,
+        s: 0.0,
+        l: 0.0,
+        a: 0.55,
+    },
 });
 
 /// 浅色皮肤。
@@ -204,6 +219,12 @@ pub static LIGHT: LazyLock<Skin> = LazyLock::new(|| Skin {
     info: rgb(0x2563EB).into(),
     border: rgb(0xD6DAE1).into(),
     checker: (rgb(0xDCDEE3).into(), rgb(0xD2D5DB).into()),
+    scrim: Hsla {
+        h: 0.0,
+        s: 0.0,
+        l: 0.0,
+        a: 0.30,
+    },
 });
 
 /// 图标按钮的边长（逻辑点）。

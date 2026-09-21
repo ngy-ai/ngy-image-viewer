@@ -61,11 +61,12 @@ main.rs  →  app.rs  →  ui/  →  render/  →  model/  →  decode/
 | `decode/` | `Path` → 像素 + 元数据 | 窗口、纹理、帧率、线程调度 |
 | `model/` | 文档事实与视图变换**纯数学** | 窗口、像素布局、GPU |
 | `render/` | 像素 → GPU 纹理 → canvas 自绘 | 交互、文件系统 |
-| `ui/` | 界面与交互状态：标题栏 + 菜单栏、工具栏、状态栏、EXIF 面板 | 像素格式、通道顺序 |
+| `ui/` | 界面与交互状态：标题栏 + 菜单栏、工具栏、状态栏、EXIF 面板、设置关联浮层 | 像素格式、通道顺序 |
 | `input/` | 手势状态机、滚轮换算（纯逻辑） | 元素与事件回调的接线（那在 `ui/view.rs`） |
-| `fs_ops/` | 剪贴板 / 打开 / 另存为 / 重命名 / 回收站 / **用户偏好读写** | 界面 |
+| `fs_ops/` | 剪贴板 / 打开 / 另存为 / 重命名 / 回收站 / **用户偏好读写** / **文件关联** | 界面 |
 | `ui/command.rs` | 动作清单、菜单结构、快捷键表（**零 UI 依赖**） | gpui、窗口、元素 |
 | `ui/theme.rs` | 两套皮肤的**颜色取值** + 尺寸/时长常量 | 窗口、平台、状态 |
+| `ui/assoc.rs` | 「设置关联格式」浮层的绘制 | 注册表、平台能力（那些在 `fs_ops/associations.rs`） |
 
 `render/` 是整个项目里**唯一**同时知道「图像数据长什么样」和「GPUI 怎么画」的地方。像素格式、通道顺序、纹理上限、坐标系换算都关在这一层。
 
@@ -110,7 +111,109 @@ main.rs  →  app.rs  →  ui/  →  render/  →  model/  →  decode/
 
 ---
 
-## 3. 解码层的硬性约定
+## 4. 文件关联（Windows）
+
+「设置关联格式，之后双击图片用本程序打开」。实现在 `fs_ops/associations.rs`（注册表，零 gpui 依赖）
+与 `ui/assoc.rs`（自绘浮层），入口是「工具 → 设置关联格式…」。
+
+这个功能分两步，别把两步混成一步：**登记**（写注册表，程序能做）与**成为默认**
+（改 `UserChoice`，程序做不到 —— 只能把用户送到系统 UI）。面板上的「全部关联」做前者，
+「设为默认…」做后者。
+
+### 生效规则：三级优先级，第一级我们写不进去
+
+Windows 决定「双击 `.foo` 用哪个程序」时，按顺序取第一个非空值：
+
+```text
+1. HKCU\Software\Microsoft\Windows\CurrentVersion\Explorer\FileExts\.<ext>\UserChoice
+      ← 带哈希校验；2024-02 累积更新起内核驱动 UCPD.sys 还会直接拦截写入。
+        程序写不进去，写了也无效（且会弹「应用默认值已重置」）
+2. HKCU\Software\Classes\.<ext> 的默认值              ← 我们能写，靠它生效
+3. HKLM\Software\Classes\.<ext> 的默认值              ← 需管理员，本程序不碰
+```
+
+在真机上（58 个候选扩展名）**实测**得到的结论，不是照文档推测：
+
+| 现象 | 证据 |
+| --- | --- |
+| 第 2 条写得进去、确实生效 | `.qoi` / `.jxl` 原来「问你要用哪个程序」，写入后立刻变成我们 |
+| **第 1 条存在时，第 2 条被完全压住** | `.png`（WPS 占着）、`.heic`（美图占着）写入后系统仍用原来那个 |
+| 本机 **26 / 58 个扩展名带 UserChoice**（44%） | `read_all` 在真机上的输出 |
+| 覆盖第 2 条会顶掉别的来源，**必须备份才可逆** | `.jp2` 原本由 SumatraPDF 经 `OpenWithProgids` 认领，写入后掉成「没有程序认领」 |
+
+判定「系统实际会用哪个 exe」的权威接口是 `AssocQueryStringW`（flags=0，`ASSOCSTR_EXECUTABLE`），
+排查时用它，别自己按上面的顺序"推理"。
+
+### 让本程序成为默认：只能把用户送到系统 UI
+
+`UserChoice` 那一层程序改不动，这是 Windows 的设计而非实现缺陷：微软的官方口径是
+「默认程序只能在系统 UI 里由用户改」，`UCPD.sys` 就是为此加的内核保护。因此
+`associations::open_defaults_settings()` 做的是**受支持范围内的最后一步**：
+
+```text
+ms-settings:defaultapps?registeredAppUser=<RegisteredApplications 里的值名>
+```
+
+- 值名就是 `APP_EXE`（我们写在 `HKCU\Software\RegisteredApplications` 的名字），
+  不是 `Capabilities` 的路径、也不是 ProgID。写错则翻不到本程序那一页。
+- `?registeredAppUser=` 自 Windows 11 21H2 / 22H2（2023-04 CU）与 23H2 及以后可用；
+  更早的系统忽略该参数、退化成「默认应用」列表页 —— 不会出错，只是少走一步。
+- 跳转前必须先 `ensure_registered` + 登记好候选格式：设置页里本程序那一页只列
+  `Capabilities\FileAssociations` 里登记过的格式，没登记的格式点了「设置默认值」也切不过来。
+- 打开走 `cmd /C start "" <uri>` + `CREATE_NO_WINDOW`，不走 `ShellExecute`（那要 FFI，
+  而本项目的 `unsafe` 只在 `decode/wic.rs`）。`start` 会把第一个带引号的参数当窗口标题，
+  所以那个空标题不能省。
+- **不要**试着自己算 `UserChoice` 的哈希再写注册表（SetUserFTA 那一套）：微软明令禁止，
+  且在装了 UCPD 的机器上会被拦掉 —— 表现为「有时行有时不行」，比不做更糟。
+
+### 因此界面必须是三态，不能是勾/不勾
+
+`AssocState` 有三档，`ui/assoc.rs` 给三种**可区分**的画法：
+
+| 状态 | 含义 | 画法 |
+| --- | --- | --- |
+| `None` | 与本程序无关 | 灰字灰框 |
+| `Registered` | 已登记，但系统当前用别的程序打开 | **主色字**、灰框 |
+| `Default` | 双击立即生效 | 主色字、**主色框**、深一档的底 |
+
+把后两者画成一样，用户勾完 `.png` 去双击、结果打开 WPS，只会认为功能是坏的 ——
+而真相是系统上另有程序持有该扩展名。所以 `summary()` 会明说「另有 N 个已登记，
+但系统当前用别的程序打开 —— 点「设为默认…」到系统设置里一次性切过来」，
+并且面板左下角就摆着那个按钮：把用户送到该去的地方，而不是让他自己去「设置」里翻。
+
+### 可逆性
+
+- 覆盖默认值前先把原值备份到 `HKCU\Software\ngy-image-viewer\PreviousDefaults`。
+- 取消关联时**仅当当前值确实是我们写的**才还回备份（或删值），不覆盖用户后来的选择。
+- WPS 抢关联时也在 `.png` 下留了 `ksobak` 值备份原值 —— 同一套思路，属于业界常规做法。
+
+### 其它约定
+
+- 写入的位置固定在 `HKCU` 下：`Classes\<PROG_ID>`（默认值 + `DefaultIcon` + `shell\open\command`）、
+  `Classes\<ext>\OpenWithProgids`（值是 `REG_NONE`，判定存在性要用 `get_raw_value`，
+  `Vec<u8>` 没实现 `FromRegValue`）、`RegisteredApplications`、`Capabilities`、
+  `Classes\Applications\<exe>.exe\{shell\open\command, SupportedTypes}`。
+- **不调用** `SHChangeNotify(SHCNE_ASSOCCHANGED, …)`：实测不刷新也立即生效，
+  没必要为本项目新开一处 `unsafe`（它也是全项目除 `decode/wic.rs` 外唯一的例外）。
+  若将来发现某台机器需要，再补。
+- 「能不能改关联」是**平台能力**，与「有没有打开图片」是两维：
+  `Command::is_available()` 管前者（Windows 才可用），`Command::needs_image()` 管后者。
+  别把 `is_available` 写成 `needs_image` 的别名 —— 空窗口下这个菜单项必须可点。
+- 候选扩展名**不另立清单**，直接用 `file_ops::IMAGE_EXTENSIONS`：
+  新增图片格式时只改那一处，解码与关联两端自动同步。
+- 读一次全部候选扩展名会做上百次注册表查询（实测 ~10 ms），**只在用户主动打开面板时读**，
+  绝不放渲染循环里。
+- **同一个键上「先读后写」时，权限要一起给**（`KEY_READ | KEY_SET_VALUE`）。
+  只开 `KEY_SET_VALUE` 时那次读会以 `ERROR_ACCESS_DENIED` 失败；若它被 `.ok()` 吞掉，
+  调用方就会判定「当前值不是我们写的」，于是**取消关联静默地不还回备份** ——
+  界面清掉了候选列表、也弹了提示，只有默认值还留在我们名下。实测症状就是
+  「点两次之后 `.png` 的默认值仍指着本程序」，单测与肉眼都看不出来。
+  因此「值不存在」与「读失败」必须分开：`ErrorKind::NotFound` 是前者，
+  其余一律往上抛（见 `windows_impl::default_of` 与只读路径的 `default_value` 的分工）。
+
+---
+
+## 5. 解码层的硬性约定
 
 ### 格式判定以内容为准
 
@@ -149,7 +252,8 @@ render/surface.rs 用 decode/orientation.rs 做像素级重排并烘进纹理
 | `raster.rs` | PNG/WebP 的动画要走 `apng()` / `has_animation()` 分支，静态路径会丢掉多帧 |
 | `jxl.rs` | `Render::stream()` **已经应用过方向**，所以必须报 `Orientation::Normal`，否则渲染层会再转一次；`write_to_buffer` 每次只写一部分，必须循环到写满 |
 | `svg.rs` | `tiny_skia` 的像素是**预乘**的，必须反预乘；`Pixmap::new` 返回 `Option` 而不是 `Result`；`resvg::render` 的第二个参数按**值**传 `Transform`；字体库用进程级 `OnceLock` 缓存（扫描系统字体约 50 ms） |
-| `raw.rs` | rawloader **不做裁剪**，`crops = [top, right, bottom, left]` 要自己应用；`SensorView` 用整幅传感器上的**绝对坐标**判断 CFA 颜色，所以必须传**原始** `cfa`，**不是** `cropped_cfa()`（那会把位移应用两次） |
+| `raw.rs` | rawloader **不做裁剪**，`crops = [top, right, bottom, left]` 要自己应用；`SensorView` 用整幅传感器上的**绝对坐标**判断 CFA 颜色，所以必须传**原始** `cfa`，**不是** `cropped_cfa()`（那会把位移应用两次）。另外：NEF 的 huffman 解码表要吃掉约 **640 KB 栈**，而且这个值与**图像尺寸无关**（5 MP 与 45 MP 实测同值，release）—— 解码线程默认的 2 MiB 够用（约 3 倍余量），但**别把解码线程的栈调小**：栈溢出是 `STATUS_STACK_OVERFLOW`，进程直接死，没有任何错误提示 |
+| `xpm.rs` | 颜色表的**键**是行首的 `cpp` 个字符，不能拿 `split_whitespace()` 取词 —— `"  c none"`（空格作键、含义为透明）是大量 XPM 生成器的默认写法，取词会把空格键整个吃掉，表现为「像素引用了未定义的颜色键」 |
 | `demosaic.rs` | 颜色索引 3 是某些传感器的「额外通道」，不参与可见光三通道 |
 | `wic.rs` | 见下方 GPUI/WIC 事实清单 |
 
@@ -167,7 +271,7 @@ impl Display { /* 走 short_reason */ }
 
 ---
 
-## 4. GPUI 事实清单（核实过源码，别凭记忆写）
+## 6. GPUI 事实清单（核实过源码，别凭记忆写）
 
 **本仓库的 `gpui` 不是 `gpui-0.2.2`。** `gpui-kit 0.6.1` 依赖的是 `gpui-pre 0.3.4`（`Cargo.toml` 里 package 重命名为 `gpui`）。查文档时注意这一点。
 
@@ -203,7 +307,7 @@ impl Display { /* 走 short_reason */ }
 
 ---
 
-## 5. 依赖与构建的坑
+## 7. 依赖与构建的坑
 
 | 事项 | 说明 |
 | --- | --- |
@@ -220,7 +324,7 @@ impl Display { /* 走 short_reason */ }
 
 ---
 
-## 6. 代码风格
+## 8. 代码风格
 
 - **注释与面向用户的字符串一律用中文。**
 - **注释解释「为什么」，不复述「做了什么」。** 例如不要写「// 遍历所有帧」，要写「// 用整数倍率做盒式滤波：每个输出像素对应固定数量的输入像素，既好并行也不会有累积舍入」。
@@ -232,7 +336,7 @@ impl Display { /* 走 short_reason */ }
 
 ---
 
-## 7. 测试约定
+## 9. 测试约定
 
 168 项，分三层：
 
@@ -260,20 +364,22 @@ impl Display { /* 走 short_reason */ }
 
 ---
 
-## 8. 不要做的事（范围边界）
+## 10. 不要做的事（范围边界）
 
 本期**明确不做**，架构上也不堵死：
 
 - 文件夹导航、相邻图片预加载
-- 文件关联的自动注册、安装包打包（README 里给了三系统的手工步骤）
+- 安装包打包（README 里给了三系统的手工步骤）
 - 单实例转发
 - macOS / Linux 的 HEIC / AVIF 实现
+
+**文件关联现在做了**（「工具 → 设置关联格式…」，见第 4 节），但边界要守住：**只在用户显式勾选时写注册表** —— 启动、打开图片、换皮肤都不会碰它，也绝不覆盖用户已经做出的选择。Windows 之外平台返回「不支持」而不是假装成功。
 
 最后一条要特别说明：那两个平台后端现在是**返回明确提示的桩**。原因是它们只能在对应平台上编译验证，而本仓库没有那两边的验证环境。**不要用「看起来应该能跑」的 `unsafe` 平台代码去补上它们** —— 这正是本层「宁可给出一条可操作的说法，也不提交从未被编译器检查过的代码」的约定。接入点是现成的：替换 `decode/heic/heic_macos.rs` 等文件里的 `decode`，其余各层一行都不用改。
 
 ---
 
-## 9. 环境变量
+## 11. 环境变量
 
 | 变量 | 作用 |
 | --- | --- |
@@ -300,7 +406,7 @@ impl Display { /* 走 short_reason */ }
 
 ---
 
-## 10. 改完之后怎么验证
+## 12. 改完之后怎么验证
 
 1. `cargo test` —— 全绿。
 2. `cargo check --all-targets` —— **零警告**。这个仓库目前是零警告状态，请保持。
@@ -308,3 +414,12 @@ impl Display { /* 走 short_reason */ }
    `cargo build --release` 之后跑一次第 1 节的性能测量，确认 `first_frame_with_image` 仍然与首帧同时刻。
 4. 如果新增了格式或改了方向逻辑：同时更新 `tests/decode_test.rs` 或 `tests/transform_test.rs`，并确认 README 的格式表仍然准确。
 5. 如果新增了错误路径：确认它同时有非空的 `user_message()` 与 `short_reason()`，且 `user_message()` 里带上了文件名（若该错误与某个文件相关）。
+6. **碰了文件关联、皮肤跟随系统这类「平台值」的功能，单测不够** —— 它们的正确性取决于本机的注册表与系统设置，只有真机跑一遍才算验证：
+   ```bash
+   python .workbuddy/scripts/assoc_state.py .workbuddy/shots/before.txt   # 先留快照
+   python .workbuddy/scripts/assoc_e2e.py                                 # 端到端闭环
+   ```
+   这个脚本**不能**放进 `tests/`：第 9 节写明测试不得写仓库外的文件，而它必须改真实注册表。
+   它会先备份、再写入、最后无条件清理；判据用 `AssocQueryStringW`（系统实际会用哪个 exe），
+   而不是「注册表里写了什么」—— 后者会把「写了但被 UserChoice 压住」误判成成功。
+   `assoc_probe.py` 是它的只读版（只定位面板、不改注册表），改界面布局时用它。

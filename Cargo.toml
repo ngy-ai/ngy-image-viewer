@@ -117,6 +117,11 @@ windows = { version = "0.62", features = [
     "Win32_System_Variant",
 ] }
 
+# 文件关联（`fs_ops/associations.rs`）要读写 HKCU 注册表。
+# `winreg` 是纯安全 Rust 的注册表封装 —— 用它就不必为了几十个 Win32 调用
+# 在 `decode/wic.rs` 之外新开一处 `unsafe`。它只依赖 `windows-sys`，无 C 构建链。
+winreg = "0.55"
+
 [dev-dependencies]
 # 集成测试需要用同一个 image 现场生成样本文件（只写 PNG）。
 # 特性单独声明而不是吃默认值：否则测试构建会把 AVIF 编码器等一堆用不上的东西拉进来。
