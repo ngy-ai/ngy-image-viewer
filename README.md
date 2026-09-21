@@ -445,6 +445,21 @@ src/
 
 GPUI 的 `Window::paint_image` **只接受轴对齐矩形**，整个 crate 没有公开的绘制变换入口（这是核实过源码的结论，不是推测）。因此旋转与翻转在**像素层**完成：代价是一次整图拷贝，换来的是「屏幕上看到的」与「另存为导出的」逐像素一致——不存在方向对不上的隐患。同一份像素级方向实现（`decode/orientation.rs`）同时服务 EXIF 摆正、用户旋转与另存为三条路径，并由单元测试保证它们一致。
 
+### 应用图标
+
+图标（深蓝圆角底 + 太阳与双山的「照片」意象）**在构建时嵌进 exe 的 PE 资源段**——
+GPUI 的 `WindowOptions::icon` 只对 X11 生效，Windows 的窗口 / 任务栏 / 资源管理器
+图标只能来自 exe 资源段，代码里设不了。
+
+- 图标源码：`tools/make_icon.py`（Pillow 生成多尺寸 `assets/icon.ico`，4 倍超采样
+  降下来带抗锯齿）。**改图标唯一入口是这个脚本**，别直接改 `icon.ico` 这个孤儿二进制。
+- 嵌入：`build.rs`（`winresource`），只在 Windows 生效；找不到 `rc.exe` 或图标缺失
+  只发 `cargo:warning`，不影响其他平台构建。同时写入 VERSIONINFO（名称、描述、版本
+  都取自 `Cargo.toml`）。
+- `assets/icon.ico` 需要进版本库（构建依赖它）；`target/` 已忽略。
+- 验证：`python tools/verify_embedded.py target/release/ngy-image-viewer.exe --ico assets/icon.ico --string "极速跨平台图片查看器"`——直接解析 exe 字节流，确认 6 个尺寸与 VERSIONINFO 真的进了资源段。**编译通过不等于图标嵌进去了。**
+- 改完图标的预览：`python tools/preview_sizes.py assets/icon.ico target/icon_preview.png`——每个尺寸放大 + 实际大小并排，小尺寸可辨性定稿前必看。
+
 ---
 
 ## 九、许可证

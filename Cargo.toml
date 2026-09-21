@@ -13,6 +13,10 @@ path = "src/lib.rs"
 name = "ngy-image-viewer"
 path = "src/main.rs"
 
+[build-dependencies]
+# Windows 上把 assets/icon.ico 嵌进 exe 资源段（见 build.rs）。
+winresource = "0.1"
+
 [dependencies]
 # UI / 渲染：基于 Zed GPUI 的综合性桌面框架（Apache-2.0）
 gpui-kit = "0.6"
