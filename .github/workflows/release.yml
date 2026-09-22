@@ -77,7 +77,7 @@ jobs:
             test: true
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       # Linux 的系统依赖。列全一点是有意的：少一个 -dev 包就编译失败，
       # 而失败点在 bindgen / pkg-config 里，报错信息离真正的原因很远。
@@ -137,22 +137,33 @@ jobs:
             exit 1
           fi
 
+      # 输出同时落一份到 ci-output.txt：失败时由最后那一步打成注解 ——
+      # Actions 日志对没有 token 的观察者一律 403，注解却是匿名可读的。
       - name: 跑测试
         if: matrix.test
-        run: cargo test --locked --target ${{ matrix.target }}
+        shell: bash
+        run: |
+          set -o pipefail
+          cargo test --locked --target ${{ matrix.target }} 2>&1 | tee -a ci-output.txt
 
       # macOS 的 x86_64 是在 arm64 runner 上交叉编译。C 那一侧（openjpeg）
       # 由 cmake 驱动，必须显式告诉它目标架构，否则会编出一个 arm64 的 .a
       # 然后链接阶段才炸。
       - name: 构建 release（macOS x86_64 交叉编译）
         if: matrix.platform == 'macos' && matrix.arch == 'x86_64'
+        shell: bash
         env:
           CMAKE_OSX_ARCHITECTURES: x86_64
-        run: cargo build --release --locked --target ${{ matrix.target }}
+        run: |
+          set -o pipefail
+          cargo build --release --locked --target ${{ matrix.target }} 2>&1 | tee -a ci-output.txt
 
       - name: 构建 release
         if: matrix.platform != 'macos' || matrix.arch != 'x86_64'
-        run: cargo build --release --locked --target ${{ matrix.target }}
+        shell: bash
+        run: |
+          set -o pipefail
+          cargo build --release --locked --target ${{ matrix.target }} 2>&1 | tee -a ci-output.txt
 
       # 统一用 bash：三平台行为一致，且 `command -v` 这种探测在 pwsh 里写法不同。
       # Windows runner 上 `python3` 这个名字**不保证**存在（那是 POSIX 的习惯，
@@ -179,6 +190,34 @@ jobs:
           name: ${{ matrix.platform }}-${{ matrix.arch }}
           path: dist/*
           if-no-files-found: error
+
+      # 失败信息走**注解**，不走日志。
+      #
+      # 为什么：`GET /repos/{o}/{r}/actions/jobs/{id}/logs` 对未认证请求一律 403，
+      # 于是「手上没有 GitHub token 的人」（本机就是这种情况）看不到任何构建输出，
+      # 只能看到「哪一步红了」。而 check-run 的注解是**匿名可读**的
+      # （`GET /repos/{o}/{r}/check-runs/{id}/annotations`），把输出塞进注解，
+      # 失败原因就能在没有任何凭据的情况下被读到。
+      - name: 失败时把输出打成注解
+        if: failure()
+        shell: bash
+        run: |
+          if [ ! -f ci-output.txt ]; then
+            echo "没有捕获到输出（失败发生在 tee 之前）"
+            exit 0
+          fi
+          python=python3
+          command -v python3 >/dev/null 2>&1 || python=python
+          # 注解是单条消息，换行必须转义成 %0A，'%' 本身也要先转义。
+          "$python" - <<'PY'
+          import pathlib
+
+          text = pathlib.Path("ci-output.txt").read_text(encoding="utf-8", errors="replace")
+          # 头部留一点（第一个报错往往在那里），尾部留一大片（cargo 的汇总在最后）。
+          excerpt = text[:1500] + "\n......（中略）......\n" + text[-7000:]
+          escaped = excerpt.replace("%", "%25").replace("\r", "").replace("\n", "%0A")
+          print(f"::error title=构建或测试输出::{escaped}")
+          PY
 
   release:
     name: 创建 Release
