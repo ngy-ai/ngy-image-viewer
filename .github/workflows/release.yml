@@ -82,8 +82,14 @@ jobs:
       # 打包脚本是 Python。不要依赖 runner 预装的 python3 / python：
       # Windows runner 上 `python3` 这个名字**不保证存在**（那是 POSIX 的习惯），
       # 而缺了它表现出来就是「打包这一步毫无理由地红了」—— 第一轮 CI 正是如此。
-      # setup-python 让三个平台都有确定的 `python`。
-      - uses: actions/setup-python@v5
+      #
+      # `id: py` 是为了后面用它的 **`python-path` 输出（绝对路径）**，而不是 PATH 里的
+      # 那个名字。第二轮 CI 里 Windows 的「打包」仍然红，而这一步自己却是绿的 ——
+      # 也就是说 action 跑完了、PATH 里的 `python` 却不可用（那条
+      # 「Node.js 20 is deprecated … forced to run on Node.js 24」的警告就指向它的
+      # 兼容性）。绝对路径不经过 PATH，这条路不受影响。
+      - id: py
+        uses: actions/setup-python@v5
         with:
           python-version: "3.12"
 
@@ -198,14 +204,26 @@ jobs:
           set -o pipefail
           cargo build --release --locked --target ${{ matrix.target }} 2>&1 | tee -a ci-output.txt
 
-      # 统一用 bash：三平台行为一致，且 `command -v` 这种探测在 pwsh 里写法不同。
-      # Windows runner 上 `python3` 这个名字**不保证**存在（那是 POSIX 的习惯，
-      # 哪怕同一份 CPython 安装器通常也会放一个 python3.exe 存根），所以先探再用。
+      # 用 setup-python 给出的**绝对路径**，而不是 PATH 里的 `python`。
+      #
+      # 第二轮 CI 里 Windows 的「打包」红着，而 setup-python 自己却是绿的 ——
+      # 也就是说 action 跑完了、PATH 里的 `python` 却不可用（那条
+      # 「Node.js 20 is deprecated … forced to run on Node.js 24」的警告指向它的
+      # 兼容性）。绝对路径不经过 PATH，这条路不受影响。
+      #
+      # 顺带把「解释器到底是哪个」打出来：再次失败时能一眼分清「找不到解释器」和
+      # 「脚本自己报错」—— 这两件事在 exit code 上完全一样。
       - name: 打包
         shell: bash
         run: |
           set -o pipefail
-          python packaging/package.py \
+          py="${{ steps.py.outputs.python-path }}"
+          {
+            echo "python-path（setup-python 给的绝对路径）：${py}"
+            "${py}" --version || echo "（执行不了）"
+            echo "PATH 里的 python：$(command -v python || echo '（没有）')"
+          } 2>&1 | tee -a ci-output.txt
+          "${py}" packaging/package.py \
             --platform ${{ matrix.platform }} \
             --arch ${{ matrix.arch }} \
             --binary ${{ matrix.binary }} \
@@ -257,25 +275,31 @@ jobs:
       # `git fetch` 没有配额，也不需要任何凭据，这条路不会因为别人用光了而失效。
       - name: 失败时把输出推到一个分支
         if: failure()
+        # 推不上去不该让这个 job 更难读：它自己红了会**盖住真正失败的那一步**——
+        # 第二轮 CI 就是三个红叉里只有一个是真的（打包红 → 推分支红 → 打注解红）。
+        # 失败原因写进 push-report.txt，由注解那一步一并带出来。
+        continue-on-error: true
         shell: bash
         run: |
-          set -euo pipefail
-          if [ ! -f ci-output.txt ]; then
-            echo "没有捕获到输出（失败发生在 tee 之前）"
-            exit 0
-          fi
-          branch="ci-log/${{ matrix.platform }}-${{ matrix.arch }}"
-          name="ci-log/${{ matrix.platform }}-${{ matrix.arch }}.txt"
-          mkdir -p ci-log
-          cp ci-output.txt "${name}"
-          git config user.name  "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          # 从当前提交起一个新分支，只把这一份日志放上去 ——
-          # 每个 job 推自己的分支，并发时不会互相覆盖。
-          git checkout -B "${branch}"
-          git add -f "${name}"
-          git commit -m "ci: ${{ matrix.name }} 的失败输出"
-          git push --force origin "${branch}"
+          {
+            set -x
+            if [ ! -f ci-output.txt ]; then
+              echo "没有捕获到输出（失败发生在 tee 之前）"
+              exit 0
+            fi
+            branch="ci-log/${{ matrix.platform }}-${{ matrix.arch }}"
+            name="ci-log/${{ matrix.platform }}-${{ matrix.arch }}.txt"
+            mkdir -p ci-log
+            cp ci-output.txt "${name}"
+            git config user.name  "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            # 从当前提交起一个新分支，只把这一份日志放上去 ——
+            # 每个 job 推自己的分支，并发时不会互相覆盖。
+            git checkout -B "${branch}"
+            git add -f "${name}"
+            git commit -m "ci: ${{ matrix.name }} 的失败输出"
+            git push --force origin "${branch}"
+          } > push-report.txt 2>&1 || echo "推送失败（原因在 push-report.txt 里）"
 
       # 失败信息走**注解**，不走日志。
       #
@@ -286,6 +310,8 @@ jobs:
       # 失败原因就能在没有任何凭据的情况下被读到。
       - name: 失败时把输出打成注解
         if: failure()
+        # 同上：这一步自己红了只会掩盖真正失败的那一步。
+        continue-on-error: true
         shell: bash
         run: |
           if [ ! -f ci-output.txt ]; then
@@ -293,13 +319,26 @@ jobs:
             exit 0
           fi
           # 注解是单条消息，换行必须转义成 %0A，'%' 本身也要先转义。
-          python - <<'PY'
+          # 用 setup-python 给的绝对路径，不走 PATH（理由见「打包」那一步）。
+          "${{ steps.py.outputs.python-path }}" - <<'PY'
           import pathlib
 
-          text = pathlib.Path("ci-output.txt").read_text(encoding="utf-8", errors="replace")
-          # 头部留一点（第一个报错往往在那里），尾部留一大片（cargo 的汇总在最后）。
-          excerpt = text[:1500] + "\n......（中略）......\n" + text[-7000:]
-          escaped = excerpt.replace("%", "%25").replace("\r", "").replace("\n", "%0A")
+          def excerpt(path, head, tail):
+              if not pathlib.Path(path).exists():
+                  return f"（没有 {path}）"
+              text = pathlib.Path(path).read_text(encoding="utf-8", errors="replace")
+              if len(text) <= head + tail:
+                  return text
+              return text[:head] + "\n......（中略）......\n" + text[-tail:]
+
+          # 头尾都留：第一个报错往往在头部，而 cargo 的汇总在尾部。
+          body = excerpt("ci-output.txt", 1500, 7000)
+          # 推送日志分支那一步的尝试也带上 —— 它自己不再让 job 变红，
+          # 这里就是唯一能看到「为什么没推上去」的地方。
+          body += "\n\n===== 推送 ci-log 分支的尝试 =====\n"
+          body += excerpt("push-report.txt", 200, 2500)
+
+          escaped = body.replace("%", "%25").replace("\r", "").replace("\n", "%0A")
           print(f"::error title=构建或测试输出::{escaped}")
           PY
 

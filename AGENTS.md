@@ -524,6 +524,79 @@ git tag v0.1.0 && git push origin v0.1.0     # 触发 .github/workflows/release.
 ### 首次跨平台的现实
 
 macOS 与 Linux 的构建原本从未跑过（HEIC/AVIF 在那两个平台是有意的桩，不链接 C 库；
-但 gpui 的 Linux / macOS 后端从没编过）。CI 的第一轮就是这个功能的验证，
-失败点大概率落在 Linux 的系统依赖（`libclang` / `libfontconfig` / wayland）与
-macOS 交叉编译的 C 侧（`CMAKE_OSX_ARCHITECTURES`）上。
+但 gpui 的 Linux / macOS 后端从没编过）。CI 的第一轮就是这个功能的验证。
+
+第一轮的结果：**macOS 两个架构全绿**（`ditto` / `icns` / `codesign` 与 openjpeg 的
+C 侧都没问题），**Windows 挂在「打包」**，**Linux 挂在「编译测试 / 跑测试」**。
+
+两处后来改掉的：
+
+- **Windows 的 `python3`**：那是 POSIX 的习惯，在 Windows 上它是 Microsoft Store 的
+  存根 —— `command -v python3` 找得到、执行却没反应。第一轮我写了
+  `command -v python3 || python` 的探测，于是这个失败伪装成了「打包这一步毫无理由地
+  红了」。改用 `actions/setup-python`，三个平台用同一个 `python`。
+- **不要在 CI 里 `rustup update stable`**：那会让编译器每次漂移到「当天最新」，
+  于是「本地全绿、CI 全红」多出一个与代码毫无关系的来源，而它只在发布当天才暴露。
+  用 runner 镜像里固定的那个版本就够了（`ubuntu-24.04` 当时是 1.98.1）。
+  **也不要为此加 `rust-toolchain.toml` 去钉 `1.97.0`**：rustup 会为 `1.97.0` 单独建一份
+  工具链目录，与本机已有的 `stable`（版本号也是 1.97.0）**不是同一份**，本地整棵树要重编。
+
+Linux 的系统依赖里有一条容易漏：**`libxkbcommon-x11-dev`**。`xkbcommon 0.8` 的 x11
+feature 是 `#[link(name = "xkbcommon-x11")]`，而那个 `.so` **不在** `libxkbcommon-dev`
+里 —— 少了它，前面全都编得过，只在**链接**时报 `-lxkbcommon-x11`。
+
+另有一条我第一轮写错、已更正的说法：「`libclang` ← `yeslogic-fontconfig-sys` 用 bindgen」
+**不成立**，那个 crate 只用 pkg-config；`cargo tree -i clang-sys --target
+x86_64-unknown-linux-gnu` 显示当前 Linux 目标下**没有任何 crate** 用 clang-sys。
+
+## 14. 读 CI：手上没有 token 时怎么办
+
+`GET /repos/{o}/{r}/actions/jobs/{id}/logs` 对**未认证请求一律 403**。
+既没有 `gh` 也没有 token 时，只有三条通道，按可靠性排序：
+
+1. **让 CI 自己把日志推到分支**（最终采用；**零配额、不需要任何凭据**）。
+   `release.yml` 在失败时把 `ci-output.txt` 推到 `ci-log/<平台>-<架构>`；
+   每个 job 推自己那一条，并发时不互相覆盖。`actions/checkout` 默认是 detached HEAD，
+   `git checkout -B` 可以直接建分支；`permissions: contents: write` 加上 checkout 默认的
+   persist-credentials 就够 push。失败时还另存一份**环境现场**（编译器版本、
+   pkg-config 能对上的包、关键 `.so`、内存磁盘、dmesg 里的 OOM）——
+   「编译不过 / 少一个 .so / 被 OOM 杀掉」在 cargo 输出里都只是同一个 exit 101。
+2. **状态徽章** `…/actions/workflows/<wf>/badge.svg?branch=<ref>` —— 走 `github.com`
+   而不是 `api.github.com`，**零配额**，SVG 里写着 passing / failing。
+   注意它只反映该 ref **最近一次已完成**的运行：进行中时它保持上一次的值，
+   所以「一开始就是 failing」不代表这一次也失败。
+3. **check-run 注解** `…/check-runs/{id}/annotations` —— 匿名可读，但**消耗
+   `api.github.com` 的匿名配额，而那个配额是按出口 IP 算的**。本机走共享代理，
+   实测几分钟内就从「剩 54 次」掉到 0。只适合偶尔一看。
+
+⚠️ **同一台机器上 `curl` 与 Python 的 `urllib` 可能走不同的出口 IP**（实测一个还剩 54
+次、另一个已经是 0）。所以「`rate_limit` 显示还有余额，紧接着请求就 403」是正常现象，
+不是 GitHub 抽风 —— 脚本里统一用 subprocess 调 curl。
+
+⚠️ **「成功」没有 git 信号**（只有失败会推分支），所以判断成功只能靠徽章翻面。
+排查时先记下起点状态，`watch_ci.py` 会替你打印。
+
+脚本都在 `.workbuddy/scripts/`：`watch_ci.py`（徽章 + git 分支，零配额）、
+`fetch_ci.py`（走注解 / API）、`watch_run.py`、`packaging/package.py`（打包）。
+
+### 想在本机验 Linux 能不能编：`cargo check` 可以，`cargo build` 不行
+
+```bash
+# cargo check 不链接，所以不需要 Linux 链接器
+cargo check --all-targets --target x86_64-unknown-linux-gnu
+```
+
+这是**唯一**能在 Windows 上抓出「从没在 Linux 上编译过」的代码错误的手段。
+但它到不了底：`wayland-backend` 有 build script，会用 `cc` 去编 C，
+需要 `x86_64-linux-gnu-gcc` —— 本机没有，于是停在
+`error occurred in cc-rs: failed to find tool "x86_64-linux-gnu-gcc"`。**这不是代码问题。**
+
+装 Linux 标准库时：清华镜像 404（`mirrors.tuna.tsinghua.edu.cn/rustup` 没同步那个日期），
+**中科大可用**：
+
+```bash
+RUSTUP_DIST_SERVER=https://mirrors.ustc.edu.cn/rust-static \
+  rustup target add x86_64-unknown-linux-gnu
+```
+
+（装完会有一条 `could not delete temp directory … os error 5` 的警告，无害。）
