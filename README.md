@@ -30,12 +30,23 @@
 | 平台 | 构建与运行 | HEIC / HEIF | AVIF | 说明 |
 | --- | --- | --- | --- | --- |
 | **Windows 10 / 11** | ✅ 已实测 | ✅ | ✅ | 分别依赖系统的「HEIF 图像扩展」与「AV1 图像扩展」（免费，缺失时应用会给出安装指引） |
-| **macOS 15+** | ⚠️ 未实测 | ⛔ 未接入 | ⛔ 未接入 | 需要 macOS 15 或更高（gpui-kit 0.6 的要求）。HEIC/AVIF 需要 ImageIO 绑定，而本项目当前没有 macOS 验证环境，因此返回一条明确的提示而非静默失败 |
-| **Linux** | ⚠️ 未实测 | ⛔ 未接入 | ⛔ 未接入 | 同上，HEIC/AVIF 需要 libheif / libavif 绑定 |
+| **macOS 15+** | ⚠️ 构建已跑通，**运行未实测** | ⛔ 未接入 | ⛔ 未接入 | 需要 macOS 15 或更高（gpui-kit 0.6 的要求）。两个架构都编过并通过测试（x86_64 那个是在 arm64 runner 上交叉编译的，产物本机跑不起来，因此不跑测试）。HEIC/AVIF 需要 ImageIO 绑定，当前没接，会返回一条明确的提示而非静默失败 |
+| **Linux** | ⚠️ 构建已跑通，**运行未实测** | ⛔ 未接入 | ⛔ 未接入 | 同上，HEIC/AVIF 需要 libheif / libavif 绑定 |
 
-> **关于「未实测」的说明**：除 HEIC/AVIF 之外的全部功能（14 种栅格格式、JPEG XL、SVG、相机 RAW、缩放平移、文件操作）都是**平台无关**的 Rust 代码，理论上在三个系统上行为一致。但作者只在 Windows 上编译并运行过，macOS / Linux 的构建步骤与系统依赖来自各依赖 crate 的文档而非实测——如果你在那边遇到问题，那就是尚未验证过的地方。
+> **「构建已跑通」说的是什么**：发布包由 CI 在三个**原生** runner 上各自构建
+> （`.github/workflows/release.yml`），所以「能不能编过、测试过没过、包打不打得出来」
+> 这三件事在 macOS 与 Linux 上是有结论的。
+> **没有结论的是「窗口在你的桌面上长什么样」** —— 没有人在这两个系统上真正打开过它。
+> gpui 的窗口后端、字体回退、HiDPI、输入法这些只有在真机上才看得出来，遇到问题请提 issue。
 >
-> **关于 HEIC/AVIF 的取舍**：这两种格式的图像数据是 HEVC / AV1 编码。自己接需要一个成熟的视频解码器外加一整套 YUV→RGB 色彩换算（数百行 `unsafe` FFI），而三大系统都已内置这两种解码能力。因此 Windows 复用 WIC，macOS / Linux 预留了 ImageIO / libheif 的接入点。**宁可给出一条可操作的说法，也不提交从未被编译器检查过的平台代码**——这正是本项目「绝不静默失败」这条约定的延伸。
+> 除 HEIC/AVIF 之外的全部功能（14 种栅格格式、JPEG XL、SVG、相机 RAW、缩放平移、
+> 文件操作）都是**平台无关**的 Rust 代码，三个系统上跑的是同一份逻辑。
+>
+> **关于 HEIC/AVIF 的取舍**：这两种格式的图像数据是 HEVC / AV1 编码。自己接需要一个
+> 成熟的视频解码器外加一整套 YUV→RGB 色彩换算（数百行 `unsafe` FFI），而三大系统都已
+> 内置这两种解码能力。因此 Windows 复用 WIC，macOS / Linux 预留了 ImageIO / libheif 的
+> 接入点。**宁可给出一条可操作的说法，也不提交从未被编译器检查过的平台代码** ——
+> 这正是本项目「绝不静默失败」这条约定的延伸。
 
 ---
 
@@ -66,7 +77,7 @@ cargo build --release
 
 `.cargo/config.toml` 里为 MSVC 打开了静态链接 CRT（`-C target-feature=+crt-static`）：这样发布版不依赖 VC++ 运行库，双击打开时也少一次 DLL 查找。
 
-### macOS（未实测）
+### macOS（构建已在 CI 上跑通，运行未实测）
 
 ```bash
 # 1. 前提：macOS 15 或更高
@@ -85,18 +96,33 @@ cargo build --release
 ./target/release/ngy-image-viewer
 ```
 
-### Linux（未实测）
+macOS 侧**不需要额外装系统库**：字体走 CoreText、HEIC/AVIF 走 ImageIO，都是系统自带的
+（这一条在 CI 上得到验证 —— 那边的 macOS job 一个 `brew install` 都没有做过）。
+
+### Linux（构建已在 CI 上跑通，运行未实测）
 
 ```bash
-# 1. Rust
+# 1. 系统依赖。少一个 -dev 包就编译失败，而报错点离真正的原因很远
+#    （一句 `undefined reference`，或者 pkg-config 的 `Package X was not found`）。
+sudo apt-get install -y \
+  build-essential cmake pkg-config clang libclang-dev \
+  libfontconfig1-dev libfreetype-dev \
+  libwayland-dev libxkbcommon-dev libxkbcommon-x11-dev \
+  libx11-dev libxcb1-dev libvulkan-dev
+
+# 2. Rust
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 
-# 2. 构建
+# 3. 构建
 cargo build --release
 
-# 3. 产物
+# 4. 产物
 ./target/release/ngy-image-viewer
 ```
+
+**`libxkbcommon-x11-dev` 是单独一个包、最容易漏**：`libxkbcommon-dev` 里**没有**
+`libxkbcommon-x11.so`，而 gpui 会链接它 —— 少了它，前面全都编得过，只在链接时报
+`-lxkbcommon-x11`。
 
 Linux 上有两处**运行期**依赖值得先确认（都来自依赖 crate 的默认特性）：
 
