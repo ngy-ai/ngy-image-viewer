@@ -31,6 +31,10 @@ env:
   CARGO_TERM_COLOR: always
   # 依赖里的 C 代码（openjpeg）在 CI 上不要尝试并行到把 runner 内存吃满。
   CARGO_BUILD_JOBS: 4
+  # 双保险：`packaging/package.py` 自己会 reconfigure 两个流，但环境变量能让它
+  # 调起来的任何子进程也拿到 UTF-8 —— Windows 上默认是控制台的代码页（cp1252），
+  # 打印一句中文就会抛 UnicodeEncodeError。
+  PYTHONIOENCODING: utf-8
 
 jobs:
   build:

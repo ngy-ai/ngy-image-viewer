@@ -33,6 +33,20 @@ import tarfile
 import zipfile
 from pathlib import Path
 
+# stdout / stderr 强制 UTF-8。
+#
+# 不设的话，Windows 上 Python 用**控制台的代码页**编码输出。本机是中文代码页，
+# 编得了中文，所以本地一直是好的；而 GitHub 的 Windows runner 是 en-US（cp1252），
+# 于是 `print("产物：…")` 这一句直接抛 UnicodeEncodeError —— 而那时**包已经打好了**，
+# 却因为最后一行日志崩掉而报失败。这个 bug 让三轮 CI 白跑
+# （macOS / Linux 默认就是 UTF-8，所以只有 Windows 挂，症状是「构建成功、打包失败」）。
+#
+# 放在脚本自己这里，而不是指望调用方记得设 PYTHONIOENCODING ——
+# 「本地能跑、CI 挂」这类问题应该在脚本内部被消灭掉。
+for _stream in (sys.stdout, sys.stderr):
+    if hasattr(_stream, "reconfigure"):
+        _stream.reconfigure(encoding="utf-8", errors="replace")
+
 ROOT = Path(__file__).resolve().parent.parent
 PACKAGING = ROOT / "packaging"
 APP = "ngy-image-viewer"
