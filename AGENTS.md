@@ -549,6 +549,36 @@ feature 是 `#[link(name = "xkbcommon-x11")]`，而那个 `.so` **不在** `libx
 **不成立**，那个 crate 只用 pkg-config；`cargo tree -i clang-sys --target
 x86_64-unknown-linux-gnu` 显示当前 Linux 目标下**没有任何 crate** 用 clang-sys。
 
+### 三轮 CI 才找到的那一个根因：Windows 上打印中文会炸
+
+症状是「Windows 的测试过、release 构建过、**打包失败**」，而 macOS / Linux 全绿。
+真正的报错是：
+
+```
+File "...\packaging\package.py", line 227, in main
+  print(f"产物：{archive}（{size_mb:.1f} MiB）")
+File "C:\...\Lib\encodings\cp1252.py", line 19, in encode
+UnicodeEncodeError: 'charmap' codec can't encode characters in position 0-2
+```
+
+Windows 上 Python 用**控制台代码页**编码 stdout。本机是中文代码页、编得了中文，所以
+本地一直是绿的；GitHub 的 Windows runner 是 en-US（cp1252）。而崩溃点在**最后一行
+日志** —— 那时 zip 已经写好了。
+
+> **包是好的，失败的是「报告成功」这句话。**
+
+修法：脚本自己在开头把两个流 reconfigure 成 UTF-8（`sys.stdout.reconfigure(…)`），
+workflow 里同时设 `PYTHONIOENCODING: utf-8` 作为双保险。**本地可复现**：
+
+```bash
+PYTHONIOENCODING=cp1252 python packaging/package.py --platform windows …
+```
+
+**教训**：前两轮我把它当成「PATH 里没有 `python`」来修（换 `setup-python`、再换绝对
+路径），两次都没用。真正让人走出来的是**把「解释器到底是哪个」也打出来** ——
+那行 `PATH 里的 python：/c/hostedtoolcache/…` 直接证伪了那个假设。
+诊断信息要打在**假设的旁边**，否则它只能证明你已经相信的事。
+
 ## 14. 读 CI：手上没有 token 时怎么办
 
 `GET /repos/{o}/{r}/actions/jobs/{id}/logs` 对**未认证请求一律 403**。
