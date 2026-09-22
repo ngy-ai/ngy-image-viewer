@@ -1,0 +1,17 @@
+[Desktop Entry]
+Type=Application
+Version=1.0
+Name=ngy-image-viewer
+Name[zh_CN]=ngy-image-viewer 图片查看器
+Comment=极速图片查看器：双击图片，瞬间打开
+Comment[en]=Fast image viewer
+# `%f` 不能省：它让文件管理器把「被双击的那个文件路径」作为参数传进来，
+# 应用才可能瞬间打开它。漏掉的话双击只会开一个空窗口。
+Exec=ngy-image-viewer %f
+Icon=ngy-image-viewer
+Terminal=false
+Categories=Graphics;Viewer;
+StartupNotify=false
+MimeType=image/png;image/jpeg;image/gif;image/webp;image/tiff;image/bmp;image/x-icon;image/x-xcf;image/svg+xml;image/avif;image/heic;image/heif;image/jxl;image/x-tga;image/x-portable-anymap;image/x-portable-bitmap;image/x-portable-graymap;image/x-portable-pixmap;image/vnd.microsoft.icon;image/vnd-ms.dds;image/x-exr;image/x-hdr;image/qoi;image/jp2;image/jpx;image/x-adobe-dng;image/x-canon-cr2;image/x-nikon-nef;image/x-sony-arw;image/x-olympus-orf;image/x-panasonic-rw2;image/x-fuji-raf;image/x-pentax-pef;
+# 注意 `Exec=ngy-image-viewer` 假设它已经在 PATH 里。便携包解压后请先
+# 把二进制装到 PATH（或把这一行改成绝对路径），否则文件管理器会找不到它。

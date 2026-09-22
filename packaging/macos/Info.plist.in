@@ -1,0 +1,55 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  `.app` bundle 的元数据模板。`@VERSION@` 由 packaging/package.py 用实际版本号替换。
+
+  这份 plist 不是装饰：macOS 上「双击图片用本程序打开」完全依赖 CFBundleDocumentTypes
+  声明了哪些类型 —— 没有它，Finder 的「打开方式」里根本不会出现本程序，
+  Dock 拖放也不会接收文件。所以它和 Windows 那边写注册表是同一件事的两个平台版本。
+-->
+<plist version="1.0">
+<dict>
+  <key>CFBundleInfoDictionaryVersion</key> <string>6.0</string>
+  <key>CFBundleName</key>                <string>ngy-image-viewer</string>
+  <key>CFBundleDisplayName</key>         <string>ngy-image-viewer</string>
+  <key>CFBundleIdentifier</key>          <string>dev.ngy.image-viewer</string>
+  <key>CFBundleExecutable</key>          <string>ngy-image-viewer</string>
+  <key>CFBundlePackageType</key>         <string>APPL</string>
+  <key>CFBundleShortVersionString</key>  <string>@VERSION@</string>
+  <key>CFBundleVersion</key>             <string>@VERSION@</string>
+  <key>CFBundleIconFile</key>            <string>icon.icns</string>
+  <key>LSApplicationCategoryType</key>   <string>public.app-category.graphics-design</string>
+  <!-- gpui-kit 0.6 要求 macOS 15 或更高；写进 plist 是为了让系统在不满足时
+       直接说「需要更新系统」，而不是启动到一半崩掉。 -->
+  <key>LSMinimumSystemVersion</key>      <string>15.0</string>
+  <key>NSHighResolutionCapable</key>     <true/>
+
+  <key>CFBundleDocumentTypes</key>
+  <array>
+    <dict>
+      <key>CFBundleTypeName</key>  <string>Image</string>
+      <key>CFBundleTypeRole</key>  <string>Viewer</string>
+      <!-- Alternate：不抢系统预览（Preview.app）的默认位置。
+           想设成本程序打开，用户在 Finder 里选一次「始终以此方式打开」即可。 -->
+      <key>LSHandlerRank</key>     <string>Alternate</string>
+      <key>LSItemContentTypes</key>
+      <array>
+        <string>public.png</string>
+        <string>public.jpeg</string>
+        <string>public.tiff</string>
+        <string>com.compuserve.gif</string>
+        <string>org.webmproject.webp</string>
+        <string>public.svg-image</string>
+        <string>public.heic</string>
+        <string>public.avif</string>
+        <string>com.microsoft.bmp</string>
+        <string>com.microsoft.ico</string>
+        <string>public.jpeg-2000</string>
+        <string>com.adobe.photoshop-image</string>
+        <string>public.camera-raw-image</string>
+      </array>
+    </dict>
+  </array>
+</dict>
+</plist>

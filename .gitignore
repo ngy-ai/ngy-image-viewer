@@ -1,5 +1,9 @@
 /target
 
+# 打包产物与中转目录（packaging/package.py 用，见 .github/workflows/release.yml）
+/dist
+/build
+
 # agent / IDE 内部数据与驱动日志（不含项目源码）
 .codebuddy/
 .workbuddy/

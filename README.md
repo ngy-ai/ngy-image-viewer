@@ -4,6 +4,25 @@
 
 > 在文件管理器里双击一张图片，窗口出现的那一刻**就已经是图像**——没有白屏，没有中间确认，没有加载动画。
 
+## 下载（预编译包）
+
+不想自己编译的话，去 [Releases](https://github.com/ngy-ai/ngy-image-viewer/releases) 取对应平台的包：
+
+| 平台 | 文件 |
+| --- | --- |
+| Windows 10 / 11 | `ngy-image-viewer-v<版本>-x86_64-windows.zip` |
+| macOS（Apple Silicon） | `ngy-image-viewer-v<版本>-arm64-macos.zip` |
+| macOS（Intel） | `ngy-image-viewer-v<版本>-x86_64-macos.zip` |
+| Linux x86_64 | `ngy-image-viewer-v<版本>-x86_64-linux.tar.gz` |
+
+**这些包没有签名，也没有公证。** 首次打开：
+
+- **macOS**：右键 → **打开**（直接双击会被 Gatekeeper 拦下说「无法验证开发者」），
+  或者 `xattr -dr com.apple.quarantine /Applications/ngy-image-viewer.app`。
+- **Windows**：SmartScreen 提示时点 **更多信息 → 仍要运行**。
+
+包内结构、以及怎么让系统把它们和图片格式关联起来，见下面第三节。
+
 ## 平台支持状态
 
 请先读这一节，它决定了下面哪些步骤你已经可以照做。
@@ -122,9 +141,21 @@ ngy-image-viewer.exe D:\photos\IMG_0001.jpg        # Windows
 
 ## 三、与系统集成
 
-> 本版本**不包含**文件关联的自动注册，也不提供安装包。下面是各系统手工关联的步骤。你只需要做一次。
+> 各平台的手工步骤都在下面。Windows 版**程序内**另有一个入口：菜单
+> **工具 → 设置关联格式…**（见下面的推荐做法）。
 
 ### Windows：把 `.jpg` / `.png` 等关联到本程序
+
+**推荐：用程序自己的入口。** 菜单 **工具 → 设置关联格式…** → 勾选要关联的格式 →
+**全部关联**。它把这些格式登记到 `HKCU\Software\Classes` 下，指向本程序。
+
+> 已有**别的程序**持有某个扩展名时（本机实测 58 个候选扩展名里有 26 个如此），
+> 光登记不足以生效 —— Windows 决定用哪个程序的 `UserChoice` 那一层程序改不动
+> （带哈希校验，2024-02 起内核驱动 `UCPD.sys` 还会拦截写入）。
+> 面板会把这种情况如实画成「已登记，但系统当前用别的程序打开」，
+> 点 **设为默认…** 跳到系统的「默认应用」页，在那里一次性切过来。
+
+**手工做法**（不想用面板时的等价操作）：
 
 1. 把 `ngy-image-viewer.exe` 放到一个**不会移动**的位置，例如 `C:\Program Files\ngy-image-viewer\`。
 2. 在资源管理器里右键任意一张图片 → **打开方式** → **选择其他应用**。
@@ -136,97 +167,62 @@ ngy-image-viewer.exe D:\photos\IMG_0001.jpg        # Windows
 
 若要取消关联：**设置 → 应用 → 默认应用** 里按文件类型改回原程序。
 
-### macOS：两种做法
+### macOS：包里的 `.app`，拖进「应用程序」就能用
 
-**做法 A：从命令行打开（无需额外步骤，但每次都要开终端）**
+Releases 下载的 `*-macos.zip` 解压出来就是一个 `ngy-image-viewer.app`。拖进「应用程序」后：
+
+1. **首次打开**：右键 → **打开**（直接双击会被 Gatekeeper 拦下，见下面的说明）。
+2. **绑定图片格式**：右键任意图片 → **打开方式** → **其他…** → 选中 `ngy-image-viewer.app`
+   → 勾选「始终以此方式打开」。
+
+`.app` 里的 `Info.plist` 已经声明了它认得的类型（PNG / JPEG / TIFF / GIF / WebP / SVG /
+HEIC / AVIF / BMP / ICO / JPEG 2000 / PSD / 相机 RAW），所以「打开方式」菜单里能直接看到它 ——
+没有这份声明，Finder 根本不会把它列为候选。`LSHandlerRank` 写的是 `Alternate`：
+**不抢**系统「预览」的默认位置，要设成默认得由你选一次，这与 Windows 版的行为一致。
+
+从源码构建时，`packaging/package.py` 负责组出这个 `.app`（写 `Info.plist`、从
+`assets/icon.png` 生成 `.icns`、补一次 ad-hoc 签名）：
+
+```bash
+cargo build --release --target aarch64-apple-darwin     # Intel 机器换成 x86_64-apple-darwin
+python3 packaging/package.py --platform macos --arch arm64 \
+    --binary target/aarch64-apple-darwin/release/ngy-image-viewer --version 0.1.0
+```
+
+只想从命令行用、不装 `.app` 也可以：
 
 ```bash
 ./target/release/ngy-image-viewer ~/Pictures/photo.jpg
-
-# 想更顺手一点，把可执行文件放进 PATH：
-sudo cp ./target/release/ngy-image-viewer /usr/local/bin/
-ngy-image-viewer ~/Pictures/photo.jpg
+sudo cp ./target/release/ngy-image-viewer /usr/local/bin/   # 进 PATH 后不必写全路径
 ```
 
-**做法 B：包成 `.app` 以便双击打开（⚠️ 未实测，供参考）**
+### Linux：二进制进 `PATH`，再装 `.desktop`
 
-macOS 的「双击某类型文件用某程序打开」要求程序是一个 `.app` bundle。最小结构如下：
+Releases 的 `*-linux.tar.gz` 解压后是几个文件（二进制、`.desktop`、图标、README、LICENSE）：
 
 ```bash
-APP="$HOME/Applications/ngy-image-viewer.app"
-mkdir -p "$APP/Contents/MacOS"
+tar -xzf ngy-image-viewer-v0.1.0-x86_64-linux.tar.gz
+cd ngy-image-viewer-v0.1.0-x86_64-linux
 
-# 1. 放入可执行文件
-cp ./target/release/ngy-image-viewer "$APP/Contents/MacOS/ngy-image-viewer"
+# 1. 二进制进 PATH
+install -Dm755 ngy-image-viewer ~/.local/bin/ngy-image-viewer
 
-# 2. 写 Info.plist
-cat > "$APP/Contents/Info.plist" <<'PLIST'
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
-  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-  <key>CFBundleName</key>              <string>ngy-image-viewer</string>
-  <key>CFBundleIdentifier</key>        <string>dev.ngy.image-viewer</string>
-  <key>CFBundleExecutable</key>        <string>ngy-image-viewer</string>
-  <key>CFBundlePackageType</key>       <string>APPL</string>
-  <key>CFBundleShortVersionString</key><string>0.1.0</string>
-  <key>NSHighResolutionCapable</key>   <true/>
-  <key>CFBundleDocumentTypes</key>
-  <array>
-    <dict>
-      <key>CFBundleTypeName</key><string>Image</string>
-      <key>CFBundleTypeRole</key><string>Viewer</string>
-      <key>LSHandlerRank</key>      <string>Alternate</string>
-      <key>LSItemContentTypes</key>
-      <array>
-        <string>public.png</string>
-        <string>public.jpeg</string>
-        <string>public.tiff</string>
-        <string>com.compuserve.gif</string>
-        <string>org.webmproject.webp</string>
-        <string>public.svg-image</string>
-        <string>public.heic</string>
-        <string>public.avif</string>
-      </array>
-    </dict>
-  </array>
-</dict>
-</plist>
-PLIST
+# 2. desktop 入口与图标
+install -Dm644 ngy-image-viewer.desktop ~/.local/share/applications/ngy-image-viewer.desktop
+install -Dm644 ngy-image-viewer.png \
+    ~/.local/share/icons/hicolor/256x256/apps/ngy-image-viewer.png
 
-# 3. 让 Finder 重新认识它
-/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister -f "$APP"
+# 3. 注册，并设为这些类型的默认查看器
+update-desktop-database ~/.local/share/applications
+xdg-mime default ngy-image-viewer.desktop image/png image/jpeg image/gif image/webp \
+    image/tiff image/bmp image/svg+xml
 ```
 
-之后在 Finder 里右键图片 → **打开方式** → **其他…** → 选中 `ngy-image-viewer.app` → 勾选「始终以此方式打开」。
+`Exec=` 里的 `%f` 是关键：它让文件管理器把「被双击的那个文件路径」作为参数传进来，
+应用因此能瞬间打开它；漏掉的话双击只会开一个空窗口。
 
-> 这一步之所以标为未实测：`Info.plist` 的写法本身是标准做法，但本项目从未在 macOS 上跑过，因此无法保证 gpui-kit 在 bundle 环境下（相对于裸可执行文件）的窗口行为完全一致。
-
-### Linux：写一个 `.desktop` 文件
-
-```bash
-# 1. 把可执行文件放到一个稳定位置
-sudo install -Dm755 ./target/release/ngy-image-viewer /usr/local/bin/ngy-image-viewer
-
-# 2. 写 desktop 入口
-sudo tee /usr/share/applications/ngy-image-viewer.desktop >/dev/null <<'DESKTOP'
-[Desktop Entry]
-Type=Application
-Name=ngy-image-viewer
-Comment=极速图片查看器
-Exec=/usr/local/bin/ngy-image-viewer %f
-Terminal=false
-Categories=Graphics;Viewer;
-MimeType=image/png;image/jpeg;image/gif;image/webp;image/tiff;image/bmp;image/x-icon;
-DESKTOP
-
-# 3. 注册为默认查看器
-sudo update-desktop-database
-xdg-mime default ngy-image-viewer.desktop image/png image/jpeg image/gif image/webp image/tiff image/bmp
-```
-
-`Exec=` 里的 `%f` 是关键：它让文件管理器把「被双击的那个文件路径」作为参数传进来，应用因此能瞬间打开它。
+包里的 `Exec=ngy-image-viewer` 依赖它已经在 `PATH` 里（也就是第 1 步做的事）。
+装在别的位置就得把那一行改成绝对路径，否则文件管理器找不到它。
 
 验证：`xdg-mime query default image/png` 应当输出 `ngy-image-viewer.desktop`。
 
@@ -464,10 +460,42 @@ GPUI 的 `WindowOptions::icon` 只对 X11 生效，Windows 的窗口 / 任务栏
 - 验证：`python tools/verify_embedded.py target/release/ngy-image-viewer.exe --ico assets/icon.ico --string "极速跨平台图片查看器"`——直接解析 exe 字节流，确认 6 个尺寸与 VERSIONINFO 真的进了资源段。**编译通过不等于图标嵌进去了。**
 - 改完图标的预览：`python tools/preview_sizes.py assets/icon.ico target/icon_preview.png`——每个尺寸放大 + 实际大小并排，小尺寸可辨性定稿前必看。
 
+### 发布
+
+打一个 `v*` tag 即触发 `.github/workflows/release.yml`：三个**原生** runner
+（Windows / macOS / Linux）各自构建、打包，产物挂到同一个 Release 上。
+
+```bash
+git tag v0.1.0
+git push origin v0.1.0
+```
+
+几个刻意的设计：
+
+- **只在原生 runner 上编，不交叉编译。** macOS 包只能在 macOS 上编（Apple 的工具链
+  不外授权到别的宿主）；而在 Windows 上凑 Linux 交叉链还得额外拼 C 工具链（JPEG 2000
+  走 openjpeg 的 C 后端），那是条没人验证过的路。
+- **macOS 出两个包**（arm64 与 x86_64）。x86_64 那个是在 arm64 runner 上交叉编译的，
+  因此**不跑测试** —— 产物本机跑不起来，「跑不了所以不测」比「跳过测试装作测过了」诚实。
+- **tag 与 `Cargo.toml` 的版本号必须一致**，否则 CI 直接失败。不校验的话会产出
+  「文件名写着 A、exe 资源段里写着 B」的包，而这种错只有用户来问的时候才会发现。
+- **手动触发（Actions 页面的 `workflow_dispatch`）只构建、留 artifact，不创建 Release。**
+  第一次验证某个平台能不能编过时用它，不会污染 Releases。
+- 包由 `packaging/package.py` 打出，**CI 与本地是同一个脚本** —— 这样「本地能出包」
+  才是有意义的说法：本地跑一遍 Windows 分支即等价于验证了 CI 那一环。
+
+```bash
+# 本地出 Windows 包
+cargo build --release --target x86_64-pc-windows-msvc
+python packaging/package.py --platform windows --arch x86_64 \
+    --binary target/x86_64-pc-windows-msvc/release/ngy-image-viewer.exe --version 0.1.0
+```
+
 ---
 
 ## 九、许可证
 
-Apache-2.0。见 `Cargo.toml`。
+Apache-2.0，全文见 [`LICENSE`](LICENSE)。发布包里也带了一份 —— Apache-2.0 第 4 条
+要求分发二进制时附上许可证副本。
 
 第三方依赖的许可证与选择理由都写在 `Cargo.toml` 的注释里——特别是为什么关掉 `image` 的默认特性、为什么 `rav1d` 要被排除（AGPL 与 `zenavif`）、为什么 SVG 只依赖 `resvg` 而不单独依赖 `usvg`。

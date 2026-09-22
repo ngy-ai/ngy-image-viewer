@@ -11,7 +11,7 @@
 ## 1. 常用命令
 
 ```bash
-cargo test                          # 全部 168 项测试
+cargo test                          # 全部 259 项测试
 cargo test --lib render             # 只跑某一层
 cargo test --lib fs_ops             # 子模块
 cargo check --all-targets           # 必须零警告
@@ -479,3 +479,51 @@ impl Display { /* 走 short_reason */ }
      **不要走 `Ctrl+C`**：GPUI 用 `GetKeyState` 判修饰键，看不见投递的
      `WM_KEYDOWN VK_CONTROL`（已实测），投递过的「Ctrl+C」只是个普通的 `c`。
      剪贴板也不会随翻页自动更新，每读一页都要重新走一次菜单。
+
+---
+
+## 13. 发布与打包
+
+产物由 `packaging/package.py` 打出，**CI 与本地同一个脚本**。
+「本地跑一遍 Windows 分支」因此等价于验证了 CI 的那一环 —— 这条等价关系是刻意维持的，
+别在 workflow 里写一份只存在于 CI 的打包命令（那份代码永远不会被本地跑过）。
+
+```bash
+git tag v0.1.0 && git push origin v0.1.0     # 触发 .github/workflows/release.yml
+```
+
+| 平台 | 产物 | 形态 |
+| --- | --- | --- |
+| Windows | `.zip` | `ngy-image-viewer.exe` + README + LICENSE |
+| macOS arm64 / x86_64 | **两个** `.zip` | `ngy-image-viewer.app`（Info.plist + icns + 二进制） |
+| Linux | `.tar.gz` | 二进制 + `.desktop` + 图标 + README + LICENSE |
+
+### 别把这三件事当成细节
+
+- **macOS 的 zip 必须用 `ditto` 打，不能用 `zipfile`。** 只有 ditto 保留 `.app`
+  内部的可执行位；用普通 zip 打出来的包，用户解压后会得到一个「双击没反应」的 app，
+  而发布者本机上是好的 —— 这类问题在发布侧几乎不可能发现。
+- **macOS 的 `.app` 要 ad-hoc 签名（`codesign --force --sign -`），先内后外。**
+  Apple Silicon 的内核拒绝运行**完全没有签名**的可执行文件。它只解决「能不能运行」，
+  不解决 Gatekeeper：没有 Developer ID 证书就无法公证，用户首次打开仍需右键 →「打开」。
+  Release 说明里必须写明这一点，否则用户会以为是包坏了。
+- **`Info.plist` 的 `CFBundleDocumentTypes` 不是装饰。** macOS 上「双击图片用本程序打开」
+  完全依赖它声明了哪些 UTI —— 没有它，Finder 的「打开方式」里根本不会出现本程序。
+  它与 Windows 那边写注册表是同一件事的两个平台版本。
+
+### 校验与幂等
+
+- **tag 与 `Cargo.toml` 的版本号必须一致**，CI 会硬失败。不校验的话会产出
+  「文件名写着 A、exe 资源段里写着 B」的包 —— 这种错只有用户来问的时候才会发现。
+- Release 步骤是**幂等**的（`gh release view` 存在就改成 `upload --clobber`），
+  CI 失败重跑或 tag 推倒重来都不会卡在「release 已存在」。
+- 产物**少一个就不发**：一个只挂了一半产物的 Release 比没有 Release 更容易误导人。
+- 手动触发（`workflow_dispatch`）只构建、留 artifact，**不创建 Release** ——
+  验证新平台能不能编过时用它，不会污染 Releases。
+
+### 首次跨平台的现实
+
+macOS 与 Linux 的构建原本从未跑过（HEIC/AVIF 在那两个平台是有意的桩，不链接 C 库；
+但 gpui 的 Linux / macOS 后端从没编过）。CI 的第一轮就是这个功能的验证，
+失败点大概率落在 Linux 的系统依赖（`libclang` / `libfontconfig` / wayland）与
+macOS 交叉编译的 C 侧（`CMAKE_OSX_ARCHITECTURES`）上。

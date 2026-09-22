@@ -1,0 +1,266 @@
+# 三平台发布：在原生 runner 上各自构建，产物挂到一个 Release 上。
+#
+# 为什么不交叉编译：macOS 包**只能**在 macOS 上编（Apple 的工具链与 SDK 不对外
+# 授权到别的宿主），而在 Windows 上凑 Linux 交叉链又要额外拼 C 工具链（本项目
+# 的 JPEG 2000 走 openjpeg 的 C 后端）—— 那是一条没人验证过的路。三个原生
+# runner 各编各的，是最短也最诚实的一条。
+#
+# 触发：
+#   - push 一个 v* tag  → 构建 + 创建 Release + 上传三平台产物
+#   - 手动触发（Actions 页面）→ 只构建并留 artifact，不创建 Release
+#     （第一次验证 macOS / Linux 能不能编过时用它，不会污染 Releases）
+
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  # 同一个 tag 不并发跑两份；但也不取消已在进行的那份 ——
+  # 构建到一半被砍掉只会留下一个像是「失败」的红叉。
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  # 依赖里的 C 代码（openjpeg）在 CI 上不要尝试并行到把 runner 内存吃满。
+  CARGO_BUILD_JOBS: 4
+
+jobs:
+  build:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      # 一个平台挂了也要看到其余平台的结果 —— 第一次跑时
+      # 「mac 过了、linux 没过」这种信息比一个红叉有用得多。
+      fail-fast: false
+      matrix:
+        include:
+          - name: Windows x86_64
+            os: windows-latest
+            target: x86_64-pc-windows-msvc
+            platform: windows
+            arch: x86_64
+            binary: target/x86_64-pc-windows-msvc/release/ngy-image-viewer.exe
+            test: true
+
+          - name: macOS arm64
+            os: macos-latest
+            target: aarch64-apple-darwin
+            platform: macos
+            arch: arm64
+            binary: target/aarch64-apple-darwin/release/ngy-image-viewer
+            test: true
+
+          # 在 arm64 runner 上交叉编译 x86_64。不设测试：这份产物本机跑不起来，
+          # 「跑不了所以不测」比「跳过测试装作测过了」诚实。
+          - name: macOS x86_64
+            os: macos-latest
+            target: x86_64-apple-darwin
+            platform: macos
+            arch: x86_64
+            binary: target/x86_64-apple-darwin/release/ngy-image-viewer
+            test: false
+
+          - name: Linux x86_64
+            os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            platform: linux
+            arch: x86_64
+            binary: target/x86_64-unknown-linux-gnu/release/ngy-image-viewer
+            test: true
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # Linux 的系统依赖。列全一点是有意的：少一个 -dev 包就编译失败，
+      # 而失败点在 bindgen / pkg-config 里，报错信息离真正的原因很远。
+      #   libclang           ← yeslogic-fontconfig-sys 用 bindgen 生成绑定
+      #   libfontconfig/free ← resvg 的 system-fonts 特性
+      #   libwayland/xkb     ← gpui 的 Linux 后端
+      #   cmake              ← openjpeg-sys（JPEG 2000 的 C 后端）
+      - name: 安装 Linux 系统依赖
+        if: matrix.platform == 'linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential cmake pkg-config \
+            clang libclang-dev \
+            libfontconfig1-dev libfreetype-dev \
+            libwayland-dev libxkbcommon-dev \
+            libx11-dev libxcb1-dev \
+            libvulkan-dev
+
+      # 不用第三方 toolchain action：runner 上已经装了 rustup，两行就够，
+      # 少一个上游依赖就少一处可能失效的地方。
+      - name: 准备 Rust 工具链
+        run: |
+          rustup update stable --no-self-update
+          rustup default stable
+          rustup target add ${{ matrix.target }}
+
+      # 依赖源码与编译产物的缓存。Swatinem/rust-cache 会跳过我们自己 crate 的
+      # 产物（那部分每次都变，缓存它反而拖慢），只缓存依赖 —— 这正是想要的。
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: 确定版本号
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
+            version="${GITHUB_REF_NAME#v}"
+          else
+            version="$(grep -m1 '^version = ' Cargo.toml | sed -E 's/.*"(.*)".*/\1/')"
+          fi
+          echo "VERSION=${version}" >> "${GITHUB_ENV}"
+          echo "版本号：${version}"
+
+      # 包里的版本号与 tag 必须是同一个数。不校验的话，改了 Cargo.toml 却忘了
+      # 打新 tag（或反过来）会产出一个「文件名是 A、exe 资源段里写着 B」的包，
+      # 而这种错只有用户来问的时候才会发现。
+      - name: 校验 tag 与 Cargo.toml 的版本一致
+        if: startsWith(github.ref, 'refs/tags/')
+        shell: bash
+        run: |
+          set -euo pipefail
+          manifest="$(grep -m1 '^version = ' Cargo.toml | sed -E 's/.*"(.*)".*/\1/')"
+          if [[ "${manifest}" != "${VERSION}" ]]; then
+            echo "::error::tag v${VERSION} 与 Cargo.toml 里的 ${manifest} 不一致"
+            exit 1
+          fi
+
+      - name: 跑测试
+        if: matrix.test
+        run: cargo test --locked --target ${{ matrix.target }}
+
+      # macOS 的 x86_64 是在 arm64 runner 上交叉编译。C 那一侧（openjpeg）
+      # 由 cmake 驱动，必须显式告诉它目标架构，否则会编出一个 arm64 的 .a
+      # 然后链接阶段才炸。
+      - name: 构建 release（macOS x86_64 交叉编译）
+        if: matrix.platform == 'macos' && matrix.arch == 'x86_64'
+        env:
+          CMAKE_OSX_ARCHITECTURES: x86_64
+        run: cargo build --release --locked --target ${{ matrix.target }}
+
+      - name: 构建 release
+        if: matrix.platform != 'macos' || matrix.arch != 'x86_64'
+        run: cargo build --release --locked --target ${{ matrix.target }}
+
+      # 统一用 bash：三平台行为一致，且 `command -v` 这种探测在 pwsh 里写法不同。
+      # Windows runner 上 `python3` 这个名字**不保证**存在（那是 POSIX 的习惯，
+      # 哪怕同一份 CPython 安装器通常也会放一个 python3.exe 存根），所以先探再用。
+      - name: 打包
+        shell: bash
+        run: |
+          set -euo pipefail
+          if command -v python3 >/dev/null 2>&1; then
+            python=python3
+          else
+            python=python
+          fi
+          echo "用 ${python} 打包"
+          "${python}" packaging/package.py \
+            --platform ${{ matrix.platform }} \
+            --arch ${{ matrix.arch }} \
+            --binary ${{ matrix.binary }} \
+            --version "${VERSION}"
+
+      - name: 上传产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.platform }}-${{ matrix.arch }}
+          path: dist/*
+          if-no-files-found: error
+
+  release:
+    name: 创建 Release
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    steps:
+      - name: 取回全部平台的产物
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: 确认产物齐全
+        shell: bash
+        run: |
+          set -euo pipefail
+          ls -la dist
+          # 四个包（Windows / macOS 两个架构 / Linux）少一个就不发 ——
+          # 一个「只挂了一半产物」的 Release 比没有 Release 更容易误导人。
+          # `|| true` 是必须的：grep -c 在零匹配时退出码是 1，配合 set -e 会让
+          # 脚本在报出真正的原因之前就死掉。
+          expected=4
+          actual="$(ls -1 dist | grep -cE '\.(zip|tar\.gz)$' || true)"
+          if [[ "${actual}" -lt "${expected}" ]]; then
+            echo "::error::只找到 ${actual} 个产物，期望 ${expected} 个"
+            exit 1
+          fi
+
+      - name: 写 Release 说明
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          cat > notes.md <<'NOTES'
+          ## 下载
+
+          | 平台 | 文件 | 说明 |
+          | --- | --- | --- |
+          | Windows 10 / 11 | `ngy-image-viewer-__TAG__-x86_64-windows.zip` | 解压即用。已静态链接 CRT，不需要装 VC++ 运行库 |
+          | macOS（Apple Silicon） | `ngy-image-viewer-__TAG__-arm64-macos.zip` | 解压后把 `ngy-image-viewer.app` 拖进「应用程序」 |
+          | macOS（Intel） | `ngy-image-viewer-__TAG__-x86_64-macos.zip` | 同上，按机器架构各取所需 |
+          | Linux x86_64 | `ngy-image-viewer-__TAG__-x86_64-linux.tar.gz` | 解压后把二进制放进 `PATH`，再把包里的 `.desktop` 装到 `~/.local/share/applications/` |
+
+          ### 首次打开可能被系统拦下
+
+          - **macOS**：这些包**没有签名、也没有公证**（那需要付费的 Apple Developer 账号）。
+            首次打开请**右键 →「打开」**，或执行
+            `xattr -dr com.apple.quarantine /Applications/ngy-image-viewer.app`。
+            直接双击会被 Gatekeeper 提示「无法验证开发者」。
+          - **Windows**：SmartScreen 可能提示「Windows 已保护你的电脑」，
+            点「更多信息 → 仍要运行」。exe 的属性 →「详细信息」里有版本信息可核对。
+
+          ### 系统要求
+
+          - macOS **15 或更高**（gpui-kit 0.6 的要求）
+          - Linux 需要图形环境（X11 或 Wayland）与 Vulkan / OpenGL 驱动
+          - HEIC / AVIF：Windows 走系统 WIC（缺「HEIF 图像扩展」时会给出安装指引）；
+            macOS / Linux **尚未接入**，会返回一条明确的提示而不是静默失败
+
+          ### 已知限制
+
+          macOS 与 Linux 的构建与运行来自 CI 的首次实测 —— 在此之前本项目从未在这两个
+          系统上编过。遇到问题请带上系统版本与复现步骤提 issue。
+
+          完整说明、支持的格式清单，以及手工把格式关联到本程序的步骤，见仓库 README。
+          NOTES
+          sed -i "s/__TAG__/${TAG}/g" notes.md
+          cat notes.md
+
+      - name: 创建或更新 Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          # 幂等：CI 失败重跑、或 tag 被推倒重来时不至于卡在「release 已存在」。
+          if gh release view "${TAG}" >/dev/null 2>&1; then
+            gh release upload "${TAG}" dist/* --clobber
+          else
+            gh release create "${TAG}" \
+              --title "${TAG}" \
+              --notes-file notes.md \
+              dist/*
+          fi
