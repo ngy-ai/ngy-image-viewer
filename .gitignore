@@ -4,6 +4,10 @@
 /dist
 /build
 
+# Python 字节码：tools/ 与 packaging/ 下跑一次脚本就会生成，不入库
+__pycache__/
+*.pyc
+
 # agent / IDE 内部数据与驱动日志（不含项目源码）
 .codebuddy/
 .workbuddy/
