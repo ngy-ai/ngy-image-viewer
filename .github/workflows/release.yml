@@ -87,12 +87,22 @@ jobs:
         with:
           python-version: "3.12"
 
-      # Linux 的系统依赖。列全一点是有意的：少一个 -dev 包就编译失败，
-      # 而失败点在 bindgen / pkg-config 里，报错信息离真正的原因很远。
-      #   libclang           ← yeslogic-fontconfig-sys 用 bindgen 生成绑定
-      #   libfontconfig/free ← resvg 的 system-fonts 特性
-      #   libwayland/xkb     ← gpui 的 Linux 后端
-      #   cmake              ← openjpeg-sys（JPEG 2000 的 C 后端）
+      # Linux 的系统依赖。每一条都对应一个真实的链接或 pkg-config 需求 ——
+      # 少一个 -dev 包，报错点离真正的原因很远（一句 `undefined reference`，
+      # 或者 pkg-config 的 `Package X was not found`）。
+      #   cmake                ← openjpeg-sys 要自己编 C 源码（JPEG 2000 后端）
+      #   libfontconfig1-dev   ← zed-font-kit（经 gpui-pre-wgpu 的 font-kit 特性）
+      #   libfreetype-dev      ← 同上
+      #   libwayland-dev       ← gpui 的 wayland 后端开了 client_system，会真的链接它
+      #   libxkbcommon-dev     ← xkbcommon 的 `#[link(name = "xkbcommon")]`
+      #   libxkbcommon-x11-dev ← xkbcommon 的 x11 feature 是
+      #                          `#[link(name = "xkbcommon-x11")]`，而那个 .so
+      #                          **不在** libxkbcommon-dev 里。少了这一条，前面
+      #                          全都编得过，只在链接时报 -lxkbcommon-x11
+      #   libx11-dev/libxcb1-dev/libvulkan-dev ← gpui 的 x11 后端与 wgpu 的 Vulkan
+      #   clang/libclang-dev   ← 保险：`cargo tree -i clang-sys --target
+      #                          x86_64-unknown-linux-gnu` 显示当前 Linux 目标下
+      #                          没有任何 crate 用它，留着只因为代价是几十秒。
       - name: 安装 Linux 系统依赖
         if: matrix.platform == 'linux'
         run: |
@@ -101,16 +111,20 @@ jobs:
             build-essential cmake pkg-config \
             clang libclang-dev \
             libfontconfig1-dev libfreetype-dev \
-            libwayland-dev libxkbcommon-dev \
+            libwayland-dev libxkbcommon-dev libxkbcommon-x11-dev \
             libx11-dev libxcb1-dev \
             libvulkan-dev
 
-      # 不用第三方 toolchain action：runner 上已经装了 rustup，两行就够，
-      # 少一个上游依赖就少一处可能失效的地方。
+      # 用 runner 预装的 stable，**不** `rustup update` —— 那样会让编译器版本每次
+      # 都漂移到「当天最新」，于是「本地全绿、CI 全红」多出一个与代码无关的来源，
+      # 而这类问题只在发布当天才暴露。runner 镜像里的版本是固定的，可复现。
+      # 不用第三方 toolchain action：runner 上已经有 rustup，少一个上游依赖
+      # 就少一处可能失效的地方。
       - name: 准备 Rust 工具链
+        shell: bash
         run: |
-          rustup update stable --no-self-update
-          rustup default stable
+          set -euo pipefail
+          rustc --version
           rustup target add ${{ matrix.target }}
 
       # 依赖源码与编译产物的缓存。Swatinem/rust-cache 会跳过我们自己 crate 的
@@ -145,8 +159,19 @@ jobs:
             exit 1
           fi
 
-      # 输出同时落一份到 ci-output.txt：失败时由最后那一步打成注解 ——
-      # Actions 日志对没有 token 的观察者一律 403，注解却是匿名可读的。
+      # 输出同时落一份到 ci-output.txt：失败时由后面那两步打成注解、并推到分支 ——
+      # Actions 日志对没有 token 的观察者一律 403。
+      #
+      # 拆成「编译」与「运行」两步：失败时**步骤名本身**就说明了是编不过还是跑不过。
+      # 第一轮 CI 里 Linux 挂在含糊的「跑测试」上，而 cargo 在编译失败与测试失败时
+      # 都返回 101，光看那一步的名字根本分不出来。
+      - name: 编译测试
+        if: matrix.test
+        shell: bash
+        run: |
+          set -o pipefail
+          cargo test --locked --target ${{ matrix.target }} --no-run 2>&1 | tee -a ci-output.txt
+
       - name: 跑测试
         if: matrix.test
         shell: bash
@@ -192,6 +217,35 @@ jobs:
           name: ${{ matrix.platform }}-${{ matrix.arch }}
           path: dist/*
           if-no-files-found: error
+
+      # 失败时把输出推到 `ci-log/<平台>-<架构>` 分支。
+      #
+      # 为什么不用 Actions 日志：`GET /actions/jobs/{id}/logs` 对未认证请求一律 403。
+      # 为什么连注解也不够：注解（`/check-runs/{id}/annotations`）虽然匿名可读，
+      # 但消耗 api.github.com 的匿名配额，而那个配额是**按出口 IP** 算的 ——
+      # 实测本机几分钟内就从「剩 54 次」掉到 0，因为出口是共享代理。
+      # `git fetch` 没有配额，也不需要任何凭据，这条路不会因为别人用光了而失效。
+      - name: 失败时把输出推到一个分支
+        if: failure()
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ ! -f ci-output.txt ]; then
+            echo "没有捕获到输出（失败发生在 tee 之前）"
+            exit 0
+          fi
+          branch="ci-log/${{ matrix.platform }}-${{ matrix.arch }}"
+          name="ci-log/${{ matrix.platform }}-${{ matrix.arch }}.txt"
+          mkdir -p ci-log
+          cp ci-output.txt "${name}"
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          # 从当前提交起一个新分支，只把这一份日志放上去 ——
+          # 每个 job 推自己的分支，并发时不会互相覆盖。
+          git checkout -B "${branch}"
+          git add -f "${name}"
+          git commit -m "ci: ${{ matrix.name }} 的失败输出"
+          git push --force origin "${branch}"
 
       # 失败信息走**注解**，不走日志。
       #
