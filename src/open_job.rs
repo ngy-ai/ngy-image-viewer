@@ -25,7 +25,7 @@ use std::sync::mpsc::{self, Receiver, RecvTimeoutError, TryRecvError};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime};
 
-use crate::decode::{self, DecodeError, DecodeLimits, DecodeResult, ImageData};
+use crate::decode::{self, DecodeError, DecodeLimits, DecodeResult, Frame, ImageData, ImageFormat};
 use crate::perf;
 use crate::trace;
 
@@ -47,6 +47,12 @@ pub struct OpenOutcome {
     pub file: Option<FileStat>,
     /// 成功给出像素与元数据，失败给出可直接展示给用户的错误。
     pub result: DecodeResult<ImageData>,
+    /// 这个文件一共有多少页；不分页的格式为 1。
+    ///
+    /// 它是**在后台线程里**问出来的（见 [`run`]），所以文档构造时不必再碰一次磁盘。
+    /// 注意它与 `result` 里已解码的帧数不是一回事：解码只出第 0 页，
+    /// 其余页由 UI 按需派发补页任务（见 `decode::tiff` 的模块文档）。
+    pub page_count: usize,
     /// 纯解码耗时（含格式探测），不含进程启动。
     pub decode_ms: f64,
     /// 从 `spawn` 到出结果的总耗时 —— 衡量「感知速度」的关键数字。
@@ -62,12 +68,15 @@ impl OpenOutcome {
     pub fn log_line(&self) -> String {
         match &self.result {
             Ok(data) => format!(
-                "[open] {} -> {} {}x{} 帧数={} 方向={:?} 解码 {:.2} ms 总计 {:.2} ms",
+                "[open] {} -> {} {}x{} 帧数={} 页数={} 方向={:?} 解码 {:.2} ms 总计 {:.2} ms",
                 self.path.display(),
                 data.format.display_name(),
                 data.width(),
                 data.height(),
+                // 帧数与页数分开写：多页 TIFF 打开时帧数恒为 1（只解了第一页），
+                // 而页数才是这个文件真正有多少内容 —— 两者混成一个数字会看不出「还没补页」。
                 data.frame_count(),
+                self.page_count,
                 data.orientation,
                 self.decode_ms,
                 self.total_ms,
@@ -137,6 +146,7 @@ impl OpenTask {
             path: path.clone(),
             file: None,
             result: Err(DecodeError::corrupt(format!("无法创建解码线程：{error}"))),
+            page_count: 1,
             decode_ms: 0.0,
             total_ms: started.elapsed().as_secs_f64() * 1000.0,
         });
@@ -238,10 +248,26 @@ fn run(path: &Path, limits: DecodeLimits, started: Instant) -> OpenOutcome {
     let result = decode::decode_path(path, &limits);
     let decode_ms = decode_started.elapsed().as_secs_f64() * 1000.0;
 
+    // 页数只能在这里问：它要读文件（虽然只是目录链），而这条线程正是为此存在的。
+    // 放到 UI 线程上做就成了「打开图片时卡一下」，正是本模块要消灭的那种卡顿。
+    let page_count = match &result {
+        Ok(data) => decode::page_count(data.format, path).unwrap_or_else(|error| {
+            // 走到这里说明解码成功、但目录链读不出来，几乎只可能是边读边被改写。
+            // 按单页处理并留下痕迹，好过让整张图打不开。
+            trace::fail(
+                "open",
+                format!("读页数失败（按单页处理）：{}", error.short_reason()),
+            );
+            1
+        }),
+        Err(_) => 1,
+    };
+
     let outcome = OpenOutcome {
         path: path.to_path_buf(),
         file,
         result,
+        page_count,
         decode_ms,
         total_ms: started.elapsed().as_secs_f64() * 1000.0,
     };
@@ -256,11 +282,12 @@ fn run(path: &Path, limits: DecodeLimits, started: Instant) -> OpenOutcome {
         Ok(data) => trace::step(
             "open",
             format!(
-                "解码完成：{} {}×{} 帧数={} 方向={:?} 像素总字节={}",
+                "解码完成：{} {}×{} 已解码={} 页 总页数={} 方向={:?} 像素总字节={}",
                 data.format.display_name(),
                 data.primary().width,
                 data.primary().height,
                 data.frames.len(),
+                outcome.page_count,
                 data.orientation,
                 data.frames.iter().map(|frame| frame.rgba8.len()).sum::<usize>(),
             ),
@@ -292,8 +319,114 @@ fn worker_died(path: &Path, total_ms: f64) -> OpenOutcome {
         path: path.to_path_buf(),
         file: None,
         result: Err(DecodeError::corrupt("解码线程意外结束，未能产出结果")),
+        page_count: 1,
         decode_ms: 0.0,
         total_ms,
+    }
+}
+
+/// 后台「补一页」任务：多页 TIFF 的第 1..N 页按需解码。
+///
+/// 与 [`OpenTask`] 同构（同样的「裸线程 + 通道 + 一次性交付」），差别只有两点：
+///
+/// - 产出的是**一页**而不是整份文档；
+/// - 生命周期很短，且会被反复创建 —— 打开一份 30 页的 TIFF，就是 29 次这个任务。
+///
+/// 之所以不复用 `OpenTask`：那个会把整份文件按「新文档」的方式再解一遍，
+/// 而我们只要其中一页，且**不希望**它影响当前文档的其它状态（路径、文件信息、
+/// 用户施加的旋转都不能被重来一次）。
+pub struct PageTask {
+    path: PathBuf,
+    index: usize,
+    receiver: Receiver<DecodeResult<Frame>>,
+    settled: bool,
+    /// 连线程都创建不出来时的兜底结果，`poll` 会优先交付它。
+    pre_failed: Option<DecodeResult<Frame>>,
+}
+
+impl PageTask {
+    /// 立刻启动后台线程解码第 `index` 页。
+    pub fn spawn(path: impl Into<PathBuf>, format: ImageFormat, index: usize) -> Self {
+        Self::spawn_with_limits(path, format, index, DecodeLimits::default())
+    }
+
+    pub fn spawn_with_limits(
+        path: impl Into<PathBuf>,
+        format: ImageFormat,
+        index: usize,
+        limits: DecodeLimits,
+    ) -> Self {
+        let path = path.into();
+        let (sender, receiver) = mpsc::channel();
+        let worker_path = path.clone();
+
+        // 与 `OpenTask` 一样用裸线程：一次只可能有一个补页任务，池化只会增加延迟。
+        let spawned = thread::Builder::new()
+            .name(format!("ngy-page-{index}"))
+            .spawn(move || {
+                let frame = decode::decode_page(format, &worker_path, index, &limits);
+                // 接收端可能已被丢弃（用户换了图、关了窗口），忽略发送失败。
+                let _ = sender.send(frame);
+            });
+
+        let pre_failed = match &spawned {
+            Ok(_) => {
+                trace::step(
+                    "page",
+                    format!("开始补第 {} 页：{}", index + 1, path.display()),
+                );
+                None
+            }
+            Err(error) => {
+                trace::fail(
+                    "page",
+                    format!(
+                        "无法创建补页线程：{error}（第 {} 页会显示为解码失败）",
+                        index + 1
+                    ),
+                );
+                Some(Err(DecodeError::corrupt(format!(
+                    "无法创建补页线程：{error}"
+                ))))
+            }
+        };
+
+        Self {
+            path,
+            index,
+            receiver,
+            settled: false,
+            pre_failed,
+        }
+    }
+
+    /// 这一页是第几页（从 0 开始）。
+    pub fn index(&self) -> usize {
+        self.index
+    }
+
+    /// 非阻塞取结果。拿到后本任务即结束，再调用返回 `None`。
+    pub fn poll(&mut self) -> Option<DecodeResult<Frame>> {
+        if let Some(result) = self.pre_failed.take() {
+            self.settled = true;
+            return Some(result);
+        }
+        if self.settled {
+            return None;
+        }
+        let frame = match self.receiver.try_recv() {
+            Ok(frame) => frame,
+            Err(TryRecvError::Empty) => return None,
+            // 线程结束了却没发结果（理论上不该发生）：当成一次失败，
+            // 好过让界面一直停在「正在解码」。
+            Err(TryRecvError::Disconnected) => Err(DecodeError::corrupt(format!(
+                "补页线程意外结束，未能产出第 {} 页（{}）",
+                self.index + 1,
+                self.path.display(),
+            ))),
+        };
+        self.settled = true;
+        Some(frame)
     }
 }
 

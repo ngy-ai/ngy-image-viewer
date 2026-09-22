@@ -24,7 +24,7 @@
 //! | R / Shift+R | 顺时针 / 逆时针旋转 90° |
 //! | H / V | 水平 / 垂直翻转 |
 //! | I | 信息面板 |
-//! | ↑ / ↓ | 同目录里的上一个 / 下一个图片（目录在后台异步读取） |
+//! | ↑ / ↓ / ← / → | 同目录里的上一个 / 下一个图片（目录在后台异步读取） |
 //! | Ctrl+O / Ctrl+C / Ctrl+S | 打开 / 复制 / 另存为 |
 //! | 标题栏菜单 | 文件 / 编辑 / 视图，全部动作与上表同一份实现 |
 //! | 拖入文件 | 直接打开 |
@@ -48,7 +48,7 @@ use crate::fs_ops::file_ops::{self, Bitmap};
 use crate::fs_ops::neighbors::NeighborsTask;
 use crate::input::{PanGesture, zoom_factor_from_lines, zoom_factor_from_pixels};
 use crate::model::{ImageDocument, Size as ImageSize, Vec2, ViewTransform, ZoomMode};
-use crate::open_job::{OpenTask, OpenOutcome};
+use crate::open_job::{OpenOutcome, OpenTask, PageTask};
 use crate::perf;
 use crate::render::{Surface, ViewportConfig, ViewportSlot, viewport};
 use crate::trace;
@@ -172,9 +172,21 @@ pub struct ImageViewerView {
     /// 而它会一路走到平台层 —— 先比一次，避免每帧都来一次跨 FFI 往返。
     window_title: Option<String>,
 
-    /// 动画：动图当前帧与开始播放的时刻。
+    /// 当前要显示的内容序号：动图是帧号，多页文档是页号。
+    ///
+    /// 多页文档里它表示**用户请求的那一页**，可能比已经解码的页数大 ——
+    /// 那种情况下画布不画内容（见 [`Self::visible_index`]），
+    /// 由占位层提示「正在解码第 k 页」。它与 `document.current_page()` 的差别
+    /// 正是「请求的」与「画得出来的」：只在后者追上来的那一刻两者相等。
     frame_index: usize,
     animation_started: Instant,
+
+    /// 多页文档里正在后台补的那一页。`None` = 没有补页任务在跑。
+    ///
+    /// 与 `OpenTask` 一样是「一次性交付」：结果被取走（或任务被换掉）之后就置空。
+    /// 用户连按几次「下一页」只会有最后一个任务在跑 —— 前面的结果已经没人要了，
+    /// 留着它只会把用户带回他已经离开的那一页。
+    page_task: Option<PageTask>,
 
     toasts: Vec<Toast>,
 
@@ -269,6 +281,7 @@ impl ImageViewerView {
             window_title: None,
             frame_index: 0,
             animation_started: Instant::now(),
+            page_task: None,
             toasts: Vec::new(),
             immersive,
             fullscreen: false,
@@ -380,6 +393,10 @@ impl ImageViewerView {
 
     fn accept(&mut self, outcome: OpenOutcome) {
         trace::step("view", format!("收到打开结果：{}", outcome.log_line()));
+        // 上一份文档的补页任务必须立刻作废：它手里那一页是从**旧文件**里解出来的，
+        // 而 `pump_page` 只知道「第 k 页」这个序号 —— 留着它就会把上一张图的像素
+        // 塞进新文档的第 k 页里，而且没有任何地方会报错。
+        self.page_task = None;
         match ImageDocument::from_outcome(outcome) {
             Ok(document) => {
                 match Surface::build(&document) {
@@ -705,7 +722,13 @@ impl ImageViewerView {
         //
         // 「本平台根本做不到」是另一维，同样在这里挡一次：两条入口共用一份判断，
         // 不会出现「菜单里点不动、键盘却能触发」这种只在一边漏掉的情况。
-        if (command.needs_image() && self.document.is_none()) || !command.is_available() {
+        //
+        // 「这份文件有没有别的页」是第三维。少了它，单页图片上按 PageDown 会安静地
+        // 什么都不做 —— 而菜单里那一项是灰的，两边对不上。
+        if (command.needs_image() && self.document.is_none())
+            || (command.needs_pages() && !self.can_step_pages())
+            || !command.is_available()
+        {
             // 上面那行已经可能把菜单收起来了，所以这里仍然要重绘一次。
             cx.notify();
             return;
@@ -715,6 +738,9 @@ impl ImageViewerView {
             Command::Open => self.open_dialog(cx),
             Command::PreviousFile => self.open_neighbor(-1, cx),
             Command::NextFile => self.open_neighbor(1, cx),
+            // 页与文件是两条独立的轴：方向键换文件，PageUp / PageDown 换页。
+            Command::PreviousPage => self.step_page(-1, cx),
+            Command::NextPage => self.step_page(1, cx),
             Command::SaveAs => self.save_as(cx),
             Command::Rename => self.rename(cx),
             Command::DeleteToTrash => self.delete_to_trash(cx),
@@ -1105,9 +1131,13 @@ impl ImageViewerView {
     ///
     /// 剪贴板与另存为都要的是「屏幕上看到的那张图」，
     /// 而不是文件里存的原始朝向 —— 用户旋转过之后另存，期待的就是旋转后的结果。
+    ///
+    /// 取的也必须是**屏幕上这一份**内容：动图是当前帧，多页文档是当前页。
+    /// 一律取第一帧的话，用户翻到第 7 页再按「复制图像」，粘出来的是第 1 页 ——
+    /// 而且不会有任何提示，因为他刚才确实在屏幕上看到了第 7 页。
     fn displayed_pixels(&self) -> Option<(u32, u32, Vec<u8>)> {
         let document = self.document.as_ref()?;
-        let frame = document.primary();
+        let frame = document.content(self.visible_index()?)?;
         let orientation = document.orientation();
 
         match orientation::apply(frame.width, frame.height, &frame.rgba8, orientation) {
@@ -1117,8 +1147,21 @@ impl ImageViewerView {
         }
     }
 
+    /// 与 [`Self::displayed_pixels`] 相同，但在「这一页还没解码完」时说一句话。
+    ///
+    /// 不说的话表现是「按下复制、什么都没发生」—— 用户只会以为快捷键坏了。
+    fn ready_pixels(&mut self) -> Option<(u32, u32, Vec<u8>)> {
+        if let Some(pixels) = self.displayed_pixels() {
+            return Some(pixels);
+        }
+        if self.document.is_some() && self.visible_index().is_none() {
+            self.push_toast("这一页还在解码，请稍候再试", ToastKind::Info);
+        }
+        None
+    }
+
     pub fn copy_to_clipboard(&mut self, _cx: &mut Context<Self>) {
-        let Some((width, height, pixels)) = self.displayed_pixels() else {
+        let Some((width, height, pixels)) = self.ready_pixels() else {
             return;
         };
         let bitmap = Bitmap {
@@ -1153,7 +1196,7 @@ impl ImageViewerView {
     /// 「另存为」拿到目标路径后的实际写入。从 `pump_dialog` 调，不在 `save_as` 里直接做，
     /// 是为了让系统对话框的阻塞只发生在它自己的线程上（见 `file_ops::pick_save_path`）。
     fn perform_save_as(&mut self, destination: PathBuf) {
-        let Some((width, height, pixels)) = self.displayed_pixels() else {
+        let Some((width, height, pixels)) = self.ready_pixels() else {
             return;
         };
         let bitmap = Bitmap {
@@ -1280,16 +1323,227 @@ impl ImageViewerView {
     }
 
     /// 动图播放：按已播时间算出当前帧。
+    ///
+    /// 多页文档走的是另一条路（由用户翻页），所以这里必须**放过**它：原先那句
+    /// 「不是动图就把帧号归零」会把用户翻到的页在下一帧重置回第 1 页 ——
+    /// 表现是「按了下一页、闪一下又回来了」，而任何地方都不会报错。
     fn advance_animation(&mut self) {
         let Some(surface) = self.surface.as_ref() else {
             return;
         };
-        if !surface.is_animated() {
+        if surface.is_animated() {
+            let elapsed = self.animation_started.elapsed().as_millis() as u64;
+            self.frame_index = surface.frame_index_at(elapsed);
+        } else if !surface.is_paged() {
             self.frame_index = 0;
+        }
+    }
+
+    // ---- 多页文档 ----
+
+    /// 画布上能画出来的内容序号；请求的内容还没解码完时返回 `None`。
+    ///
+    /// 这是「请求的页」与「画得出来的页」之间唯一的那道闸：它返回 `None` 时
+    /// 画布只铺底色，占位层负责说明。**绝不退而画相邻页** ——
+    /// 那在画面上与「翻页翻对了」长得一模一样。
+    fn visible_index(&self) -> Option<usize> {
+        let surface = self.surface.as_ref()?;
+        (self.frame_index < surface.frame_count()).then_some(self.frame_index)
+    }
+
+    /// 状态栏与画布角标上的页码：`(当前, 总数)`。不分页的格式是 `None`。
+    ///
+    /// 用的是**请求的**页号而不是文档当前页：翻页时页码要立刻跟着走，
+    /// 否则那几十毫秒的解码间隙里，用户按了键却看不到任何反应。
+    fn page_indicator(&self) -> Option<(usize, usize)> {
+        let document = self.document.as_ref()?;
+        document
+            .is_paged()
+            .then(|| (self.frame_index + 1, document.pages()))
+    }
+
+    /// 当前文档有没有可翻的页。
+    ///
+    /// 菜单置灰与键盘入口共用它 —— 两处各写一遍的话，就会出现
+    /// 「菜单里灰着、按 PageDown 却有反应」这种只在一边对不上的情况。
+    fn can_step_pages(&self) -> bool {
+        self.document
+            .as_ref()
+            .is_some_and(|document| document.is_paged())
+    }
+
+    /// 「上一页 / 下一页」。`delta` 是 ±1。
+    pub fn step_page(&mut self, delta: isize, cx: &mut Context<Self>) {
+        let Some(document) = self.document.as_ref() else {
+            return;
+        };
+        if !document.is_paged() {
             return;
         }
-        let elapsed = self.animation_started.elapsed().as_millis() as u64;
-        self.frame_index = surface.frame_index_at(elapsed);
+        let pages = document.pages();
+        let target = self
+            .frame_index
+            .saturating_add_signed(delta)
+            .min(pages.saturating_sub(1));
+        if target == self.frame_index {
+            return;
+        }
+        self.show_page(target);
+        cx.notify();
+    }
+
+    /// 把视图切到第 `index` 页：已解码的直接画出来，没解码的挂一个后台任务。
+    fn show_page(&mut self, index: usize) {
+        self.frame_index = index;
+
+        let (moved, size) = match self.document.as_mut() {
+            Some(document) => (document.goto_page(index), document.logical_size()),
+            None => (false, ImageSize::ZERO),
+        };
+
+        if moved {
+            trace::step(
+                "view",
+                format!(
+                    "切到第 {}/{} 页（已解码）",
+                    index + 1,
+                    self.document.as_ref().map(|d| d.pages()).unwrap_or(1)
+                ),
+            );
+            // 各页可以有各自的尺寸（扫描件里正文 A4、插页 A3），而「适应窗口」的倍率
+            // 是按尺寸算出来的。只在适应模式里重算：1:1 与用户手动缩放的倍率
+            // 是用户明确的选择，翻一页就把它改掉是另一种错。
+            if self.transform.mode() == ZoomMode::Fit {
+                self.transform = ViewTransform::fitted(size, self.last_viewport);
+            }
+        } else {
+            self.ensure_page(index);
+        }
+    }
+
+    /// 让第 `index` 页进入解码队列。已经在解这一页时什么都不做。
+    fn ensure_page(&mut self, index: usize) {
+        if self
+            .page_task
+            .as_ref()
+            .is_some_and(|task| task.index() == index)
+        {
+            return;
+        }
+        let Some(document) = self.document.as_ref() else {
+            return;
+        };
+        if !document.is_paged() {
+            return;
+        }
+        // 上一个任务直接丢掉：它的结果已经没人要了（用户又翻了一页），
+        // 而它用的那个解码线程会自己跑完并把结果发给一个没人接的通道。
+        self.page_task = Some(PageTask::spawn(
+            document.path().to_path_buf(),
+            document.format(),
+            index,
+        ));
+    }
+
+    /// 取回补页结果。
+    fn pump_page(&mut self, cx: &mut Context<Self>) {
+        let Some(task) = self.page_task.as_mut() else {
+            return;
+        };
+        let Some(result) = task.poll() else {
+            return;
+        };
+        let index = task.index();
+        self.page_task = None;
+
+        let outcome = match result {
+            Ok(frame) => self.accept_page(index, frame),
+            Err(error) => {
+                trace::fail(
+                    "view",
+                    format!("第 {} 页解码失败：{}", index + 1, error.short_reason()),
+                );
+                Err(error.user_message())
+            }
+        };
+
+        match outcome {
+            Ok(()) => trace::step(
+                "view",
+                format!(
+                    "第 {} 页已就绪（已解码 {}/{}）",
+                    index + 1,
+                    self.document.as_ref().map(|d| d.decoded_pages()).unwrap_or(0),
+                    self.document.as_ref().map(|d| d.pages()).unwrap_or(1),
+                ),
+            ),
+            Err(message) => {
+                self.push_toast(message, ToastKind::Warning);
+                self.leave_pending_page();
+            }
+        }
+        cx.notify();
+    }
+
+    /// 把后台解出来的一页收进文档与纹理。失败时返回给用户看的一句话。
+    fn accept_page(&mut self, index: usize, frame: crate::decode::Frame) -> Result<(), String> {
+        {
+            let Some(document) = self.document.as_mut() else {
+                return Err("图片已经换掉了，这一页不再需要。".to_string());
+            };
+            if let Err(rejection) = document.append_page(index, frame) {
+                trace::fail(
+                    "view",
+                    format!("第 {} 页未能载入：{rejection:?}", index + 1),
+                );
+                return Err(rejection
+                    .user_message()
+                    .unwrap_or_else(|| "这一页未能载入。".to_string()));
+            }
+        }
+
+        // 文档是数据的归属，纹理跟着长一页。
+        let (orientation, appended) = match self.document.as_ref() {
+            Some(document) => (document.orientation(), document.content(index)),
+            None => return Ok(()),
+        };
+        let Some(surface) = self.surface.as_mut() else {
+            return Ok(());
+        };
+        // `surface` 是 `Arc<Surface>`：用 `make_mut` 拿到 `&mut`。
+        // 上一帧的绘制闭包若还持有这个 `Arc`，这里会先克隆一份 —— 克隆的是
+        // 几张纹理的 `Arc` 与一小段元数据，像素一个字节都不拷（见 `Surface` 的文档）。
+        let Some(frame) = appended else {
+            return Ok(());
+        };
+        match Arc::make_mut(surface).append_page(frame, orientation) {
+            Ok(_) => Ok(()),
+            Err(error) => {
+                trace::fail(
+                    "view",
+                    format!("第 {} 页纹理构建失败：{}", index + 1, error.short_reason()),
+                );
+                Err(error.user_message())
+            }
+        }
+    }
+
+    /// 这一页没成：把视图退回到还能显示的那一页。
+    ///
+    /// 不留在这里的理由很直接：请求的页已经确定解不出来了，继续停在它上面就是
+    /// 一片空白加一句提示，而用户完全不知道该怎么办（按上下键？重新打开？）。
+    /// 退回去至少让他能继续看别的页，提示里也已经说清了原因。
+    fn leave_pending_page(&mut self) {
+        let Some(document) = self.document.as_mut() else {
+            return;
+        };
+        let last = document.decoded_pages().saturating_sub(1);
+        document.goto_page(self.frame_index.min(last));
+        self.frame_index = document.current_page();
+        if self.transform.mode() == ZoomMode::Fit {
+            let size = document.logical_size();
+            self.transform = ViewTransform::fitted(size, self.last_viewport);
+        }
     }
 
     /// 是否需要继续请求下一帧。
@@ -1310,6 +1564,10 @@ impl ImageViewerView {
         animating
             || !self.toasts.is_empty()
             || self.task.is_some()
+            // 补页任务同理：结果只能在 `pump_page` 里被取回，而那要等下一次渲染。
+            // 漏掉这一条的表现是「翻到第 2 页之后一直停在『正在解码』」——
+            // 直到用户碰一下鼠标才突然出现。
+            || self.page_task.is_some()
             || self.neighbors_task.is_some()
             || self.preload_tasks.is_some()
             || self.pending_dialog.is_some()
@@ -1460,6 +1718,32 @@ impl ImageViewerView {
         self.open_path(path, cx);
     }
 
+    /// 画布右下角的页码角标。只在多页文档里画。
+    ///
+    /// 状态栏里已经有页码了，为什么还要它：双击打开（`immersive`）与全屏时
+    /// **状态栏整条不画**，而双击正是多页扫描件最常见的打开方式 ——
+    /// 少了这个角标，那两种形态下翻页就没有任何持久可见的反馈。
+    ///
+    /// 它是绝对定位的覆盖层，不参与布局，所以不占图像的空间；
+    /// 不出现在状态栏能出现的地方之外（非多页文档整段不画）。
+    fn page_badge(&self, skin: &Skin) -> AnyElement {
+        let Some((current, total)) = self.page_indicator() else {
+            return div().into_any_element();
+        };
+        div()
+            .absolute()
+            .right(px(12.0))
+            .bottom(px(12.0))
+            .px_2()
+            .py(px(2.0))
+            .rounded_sm()
+            .bg(skin.surface_active)
+            .text_color(skin.text_muted)
+            .text_size(px(11.0))
+            .child(format!("{current} / {total}"))
+            .into_any_element()
+    }
+
     /// 占位层：空状态给一个居中的「打开图片」按钮；加载中与失败态给文字说明。
     fn placeholder(
         &self,
@@ -1525,7 +1809,28 @@ impl ImageViewerView {
                 )
             }
             Phase::Failed { message, detail } => (message.clone(), detail.clone(), skin.danger),
-            Phase::Ready => return div().into_any_element(),
+            // 就绪，但请求的那一页还没解码完：画布此刻是空的（见 `viewport`），
+            // 不说一句话就只剩一片黑。这是「先出首页、其余后台补」这套方案里
+            // 唯一会让用户看到空白的地方，所以说明必须足够具体 ——
+            // 说清是第几页、以及整体进度到哪了。
+            Phase::Ready => match self.visible_index() {
+                Some(_) => return div().into_any_element(),
+                None => (
+                    format!("正在解码第 {} 页", self.frame_index + 1),
+                    format!(
+                        "已载入 {}/{} 页，这一页正在后台解码",
+                        self.document
+                            .as_ref()
+                            .map(|document| document.decoded_pages())
+                            .unwrap_or(0),
+                        self.document
+                            .as_ref()
+                            .map(|document| document.pages())
+                            .unwrap_or(1),
+                    ),
+                    skin.info,
+                ),
+            },
         };
 
         let ratio = pixel_ratio_of(window);
@@ -1605,6 +1910,7 @@ impl ImageViewerView {
             .unwrap_or(ImageSize::ZERO);
 
         let placeholder = self.placeholder(skin, window, view);
+        let badge = self.page_badge(skin);
         let toast = self.toast_layer(skin);
 
         let mut area = div()
@@ -1616,12 +1922,15 @@ impl ImageViewerView {
                 surface: self.surface.clone(),
                 logical_size: logical,
                 transform: self.transform,
-                frame_index: self.frame_index,
+                // 请求的这一页还没解码完时给 `None`：画布只铺底色，
+                // 由占位层说明「正在解码第 k 页」。绝不退而画相邻页。
+                frame_index: self.visible_index(),
                 slot: self.viewport.clone(),
                 background: skin.canvas,
                 checker: skin.checker,
             }))
-            .child(placeholder);
+            .child(placeholder)
+            .child(badge);
 
         if self.info_open {
             area = area.child(
@@ -1700,6 +2009,8 @@ impl Render for ImageViewerView {
 
         // 1. 先把后台结果收回来 —— 这一帧就能显示图像，而不是等到下一帧。
         self.pump_task();
+        // 多页文档补回来的那一页同样在这一帧就挂上纹理。
+        self.pump_page(cx);
         self.pump_neighbors();
         self.pump_preloads();
         // 系统对话框的结果也在每帧取回：这里只 `try_recv`，主线程从不阻塞，
@@ -1803,6 +2114,10 @@ impl Render for ImageViewerView {
         //   按钮 / 拖入打开图片**不改界面形态** —— 用户是先开程序再选图，界面忽然
         //   少两栏会像是出错；想全屏，F11 是明路。
         let has_image = self.document.is_some();
+        // 「有没有可翻的页」是菜单置灰的第三个维度，与 `has_image` 独立：
+        // 单页图片上「上一页 / 下一页」灰着，那本身就在说明这份文件只有一页。
+        let has_pages = self.can_step_pages();
+        let page_indicator = self.page_indicator();
         let compact = compact_form(has_image, self.immersive);
 
         let root = div()
@@ -1852,7 +2167,7 @@ impl Render for ImageViewerView {
             let menu_layer = if compact {
                 div().into_any_element()
             } else {
-                menu::menu_layer(skin, self.menu, has_image, self.preference, &view_handle)
+                menu::menu_layer(skin, self.menu, has_image, has_pages, self.preference, &view_handle)
             };
 
             let root = root.child(title_bar).child(toolbar).child(stage);
@@ -1860,7 +2175,12 @@ impl Render for ImageViewerView {
             let root = if compact {
                 root
             } else {
-                root.child(panels::status_bar(skin, self.document.as_ref(), zoom_percent))
+                root.child(panels::status_bar(
+                    skin,
+                    self.document.as_ref(),
+                    page_indicator,
+                    zoom_percent,
+                ))
             };
             // 下拉浮层与设置浮层必须是最后两个孩子：GPUI 按树序绘制，后画的盖住先画的。
             // 放在标题栏里（它的逻辑归属处）会被后画的画布整块盖住。

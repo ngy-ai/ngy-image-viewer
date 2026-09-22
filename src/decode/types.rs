@@ -359,7 +359,14 @@ impl ImageFormat {
         }
     }
 
-    /// 是否可能包含多帧。用于决定要不要走动画解码路径。
+    /// 这个格式是否可能包含**按时间播放的**多帧内容。
+    ///
+    /// 用途有两个：决定要不要走动画解码路径，以及把「动图」与「多页文档」分开
+    /// （见 [`ImageData::is_animated`] 与 `ImageDocument::is_paged`）。
+    ///
+    /// 它同时是「哪些格式的多个 frame 表示时间轴」这个问题的**唯一答案** ——
+    /// `decode` 层只有 GIF / APNG / 动画 WebP 三条路径会产出多帧
+    /// （见 `raster.rs` 的格式分派），这里与那里必须一致。
     pub fn may_be_animated(self) -> bool {
         matches!(self, Self::Png | Self::Gif | Self::WebP)
     }
@@ -785,8 +792,14 @@ impl ImageData {
         self.frames.len()
     }
 
+    /// 是否是「按时间自动播放的动画」。
+    ///
+    /// 判据必须带上**格式**这一维，不能只数帧数：多页 TIFF 补页之后
+    /// `frames.len()` 也会大于 1，但那些是**页**而不是帧 ——
+    /// 只数帧数的话，打开一份 30 页的 TIFF 就会像动图一样自己翻起来，
+    /// 而且用户按「下一页」时永远追不上它。
     pub fn is_animated(&self) -> bool {
-        self.frames.len() > 1
+        self.format.may_be_animated() && self.frames.len() > 1
     }
 
     /// 逻辑宽度：已经考虑 EXIF 方向对宽高的交换，以及 SVG 的超采样倍率。

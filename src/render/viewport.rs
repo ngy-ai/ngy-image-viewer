@@ -78,7 +78,13 @@ pub struct ViewportConfig {
     /// 图像的逻辑尺寸。没有图像时传 [`Size::ZERO`]。
     pub logical_size: Size,
     pub transform: ViewTransform,
-    pub frame_index: usize,
+    /// 要绘制的内容序号：动图是帧号，多页文档是页号。
+    ///
+    /// `None` = 这个内容**还没解码完**（多页文档里翻了页、后台正在补）。
+    /// 那时整段跳过图像绘制，只留底色与占位层的提示 ——
+    /// 类型上区分开，是为了不给「退而画相邻页」留任何空间：那种错误在画面上
+    /// 与「翻页翻对了」长得一模一样，只有用户觉得数字对不上才会发现。
+    pub frame_index: Option<usize>,
     pub slot: ViewportSlot,
     /// 画布底色（近黑）。
     pub background: Hsla,
@@ -104,7 +110,7 @@ pub fn viewport(config: ViewportConfig) -> impl IntoElement {
         move |bounds, _window, _cx| {
             // `prepaint` 是唯一能拿到画布真实尺寸的地方，顺手回传给视图。
             let measured = Size::new(to_f32(bounds.size.width), to_f32(bounds.size.height));
-            trace_frame("paint.prepaint", || {
+            trace_frame(|| "paint.prepaint".to_string(), || {
                 format!(
                     "画布实测尺寸={:.2}×{:.2}（原点 {:.2},{:.2}）{}",
                     measured.width,
@@ -190,10 +196,14 @@ pub fn viewport(config: ViewportConfig) -> impl IntoElement {
 
             let content = effective.content_rect(logical_size, viewport);
 
-            trace_frame("paint.decide", || {
+            // key 里带**内容序号**，而不是一个固定的 `paint.decide`：
+            // 多页文档里每翻一页就该留下一条，否则「翻到第 2 页画布却没变」这种故障
+            // 在日志上只剩一片沉默 —— 而它恰恰是最需要线索的时刻。
+            // 代价有界：key 去重后，每种内容各报一次（动图是每种帧一次，页是每页一次）。
+            trace_frame(|| format!("paint.decide/{frame_index:?}"), || {
                 format!(
                     "绘制决策：模式={:?} 倍率={:.4} 平移=({:.2},{:.2}) 逻辑尺寸={:.2}×{:.2} \
-                     画布={:.2}×{:.2} 内容矩形=({:.2},{:.2}) {:.2}×{:.2} 帧号={frame_index} 帧数={} 半透明={}",
+                     画布={:.2}×{:.2} 内容矩形=({:.2},{:.2}) {:.2}×{:.2} 内容序号={:?} 可绘制数={} 半透明={}",
                     effective.mode(),
                     effective.scale(),
                     effective.pan().x,
@@ -206,16 +216,29 @@ pub fn viewport(config: ViewportConfig) -> impl IntoElement {
                     content.origin.y,
                     content.size.width,
                     content.size.height,
+                    frame_index,
                     surface.frame_count(),
                     surface.has_transparency(),
                 )
             });
 
+            // 内容还没就绪（多页文档里请求的页正在解码）：底色已经铺过，这一帧到此为止。
+            // 这里**绝不能退而画上一页或第 1 页** —— 那会让用户以为翻页翻错了，
+            // 而画面上明明有图，谁也说不清是哪里出了问题。占位层会给出文字说明。
+            let Some(content_index) = frame_index else {
+                trace::step_once(
+                    "paint.pending",
+                    "paint",
+                    "请求的内容还没解码完：本轮只绘制底色，占位层负责提示",
+                );
+                return;
+            };
+
             if surface.has_transparency() {
                 paint_checkerboard(bounds, content, window, checker);
             }
 
-            paint_image(bounds, content, surface, frame_index, window);
+            paint_image(bounds, content, surface, content_index, window);
         },
     )
     .absolute()
@@ -223,18 +246,34 @@ pub fn viewport(config: ViewportConfig) -> impl IntoElement {
 }
 
 /// 把图像画到 `content` 描述的目标矩形上。
+///
+/// `content_index` 是「第几份内容」：动图里是帧号，多页文档里是页号。
 fn paint_image(
     canvas_bounds: Bounds<Pixels>,
     content: Rect,
     surface: &Surface,
-    frame_index: usize,
+    content_index: usize,
     window: &mut Window,
 ) {
-    // `paint_image` 内部会断言帧号有效（它会直接索引帧数组），
-    // 所以动画计时器算出的帧号必须先夹一次 —— 否则一张刚被换掉的动图
-    // 会让整个界面 panic，而这只是"晚了一帧"而已。
-    let frame_count = surface.frame_count();
-    let frame_index = frame_index.min(frame_count.saturating_sub(1));
+    // 让 `Surface` 把「哪张纹理」与「纹理内的第几帧」一起给出。
+    //
+    // 两者必须同源：分页是「每页一张单帧纹理」，动图是「一张纹理多个帧」，
+    // 分开取很容易写出「拿第 1 张纹理的第 3 帧」—— 而 `paint_image` 内部会
+    // 直接索引帧数组，那是 panic，不是黑屏（两者都很难查，但前者会带走整个窗口）。
+    //
+    // 顺带这也替掉了原先「把帧号夹到最后一帧」的那次兜底：夹帧看似安全，
+    // 实际是「你要第 5 页、我给你第 3 页」，在翻页场景里就是错的 ——
+    // 取不到就不要画，让占位层去说明。
+    let Some(texture) = surface.texture(content_index) else {
+        trace::fail(
+            "paint",
+            format!(
+                "取不到第 {content_index} 个内容的纹理（可绘制内容数={}）：界面只会显示画布底色",
+                surface.frame_count()
+            ),
+        );
+        return;
+    };
 
     let destination = Bounds::new(
         point(
@@ -270,19 +309,25 @@ fn paint_image(
         return;
     }
 
-    trace_frame("paint.call", || {
+    trace_frame(|| format!("paint.call/{content_index}"), || {
         format!(
             "paint_image：目标矩形 origin=({:.2},{:.2}) size={:.2}×{:.2} 可见区域={:.2}×{:.2} \
-             帧号={frame_index}/{frame_count} 纹理尺寸={}×{} 纹理字节={}",
+             内容序号={content_index}/{} 纹理内帧号={} 纹理尺寸={}×{} 纹理字节={}",
             to_f32(destination.origin.x),
             to_f32(destination.origin.y),
             to_f32(destination.size.width),
             to_f32(destination.size.height),
             to_f32(visible.size.width),
             to_f32(visible.size.height),
-            surface.texture_size().0,
-            surface.texture_size().1,
-            surface.image().as_bytes(0).map(|bytes| bytes.len()).unwrap_or(0),
+            surface.frame_count(),
+            texture.frame,
+            texture.size.0,
+            texture.size.1,
+            texture
+                .image
+                .as_bytes(texture.frame)
+                .map(|bytes| bytes.len())
+                .unwrap_or(0),
         )
     });
 
@@ -293,19 +338,16 @@ fn paint_image(
         destination,
         destination,
         Corners::default(),
-        surface.image().clone(),
-        frame_index,
+        texture.image.clone(),
+        texture.frame,
         false,
     );
 
     match result {
-        Ok(()) => trace_frame("paint.ok", || {
+        Ok(()) => trace_frame(|| format!("paint.ok/{content_index}"), || {
             format!(
-                "paint_image 返回成功（纹理 #{}，{}×{} 的 {} 帧）",
-                surface.image().id.0,
-                surface.texture_size().0,
-                surface.texture_size().1,
-                frame_count,
+                "paint_image 返回成功（纹理 #{}，{}×{} 的第 {} 帧）",
+                texture.image.id.0, texture.size.0, texture.size.1, texture.frame,
             )
         }),
         Err(error) => trace::fail(
@@ -314,8 +356,7 @@ fn paint_image(
                 "paint_image 返回错误：{error:#}。\
                  常见原因是纹理超出 GPU 图集容量（当前纹理 {}×{}）。\
                  这条以前只在 NGY_PERF=1 时才输出，因此表现为「黑屏但控制台寂静」。",
-                surface.texture_size().0,
-                surface.texture_size().1,
+                texture.size.0, texture.size.1,
             ),
         ),
     }
@@ -400,12 +441,13 @@ fn to_f32(pixels: Pixels) -> f32 {
 
 /// 逐帧路径上的阶段日志。
 ///
-/// 传的是**闭包**而不是拼好的字符串：`format!` 会在实参位置被无条件求值，
+/// `key` 与 `message` 都传**闭包**而不是拼好的值：`format!` 会在实参位置被无条件求值，
 /// 于是日志关闭时每个绘制帧仍要白白拼几段字符串并丢掉 —— 绘制路径是逐帧跑的，
 /// 这点开销会直接吃掉「跟手」这条产品要求。包成闭包后，关闭时连字符串都不存在。
-fn trace_frame(key: &str, message: impl FnOnce() -> String) {
+/// key 之所以也要延迟，是因为它要带上内容序号（见下面的调用处）。
+fn trace_frame(key: impl FnOnce() -> String, message: impl FnOnce() -> String) {
     if !trace::enabled() {
         return;
     }
-    trace::step_once(key, "paint", message());
+    trace::step_once(&key(), "paint", message());
 }

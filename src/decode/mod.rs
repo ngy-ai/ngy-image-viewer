@@ -47,6 +47,7 @@ pub mod raster;
 pub mod raw;
 pub mod sniff;
 pub mod svg;
+pub mod tiff;
 pub mod types;
 /// Windows 专属的 WIC 解码后端，供 HEIC 与 AVIF 共用。
 #[cfg(windows)]
@@ -86,6 +87,31 @@ pub trait Decoder: Send + Sync {
     /// - 纯计算，不做任何与 UI / 线程调度相关的事；
     /// - 失败返回语义明确的 [`DecodeError`]，**绝不 panic**（这是一条硬性产品要求）。
     fn decode(&self, src: &Path, limits: &DecodeLimits) -> DecodeResult<ImageData>;
+
+    /// 这个文件里一共有多少「页」。
+    ///
+    /// 分页是个别格式的能力（今天只有多页 TIFF），不是所有解码器的义务，
+    /// 所以默认实现是「没有分页概念」的 1 页 —— 新增解码器不必为此写一行代码。
+    fn page_count(&self, src: &Path) -> DecodeResult<usize> {
+        let _ = src;
+        Ok(1)
+    }
+
+    /// 解码其中第 `index` 页（从 0 开始）。
+    ///
+    /// 它存在的理由是**懒解码**：多页 TIFF 的页数可能上百，一次全解会让「双击即出图」
+    /// 变成「等好几秒」。所以 [`decode`](Self::decode) 只负责第 0 页保证首帧，
+    /// 其余页由上层按需调用这里补齐（见 `decode::tiff` 的模块文档）。
+    ///
+    /// 默认实现返回「不支持」而不是退回第一页：取不到第 k 页时**悄悄给第一页**
+    /// 正是最难被发现的一类错。
+    fn decode_page(&self, src: &Path, index: usize, limits: &DecodeLimits) -> DecodeResult<Frame> {
+        let _ = (src, index, limits);
+        Err(DecodeError::unsupported(
+            None,
+            "这个格式不支持按页解码",
+        ))
+    }
 }
 
 /// 解码器注册表：负责「格式 → 解码器」的派发与兜底。
@@ -106,6 +132,13 @@ impl DecoderRegistry {
                 // 顺序 = 兜底尝试顺序，越靠前越优先。
                 // 这些解码器的 `formats()` 互不重叠，实际派发由 magic bytes 决定，
                 // 顺序只影响「内容判不出格式时谁先自荐」这种边缘情况。
+                //
+                // 唯一的例外是 TIFF，它**有意**与 `raster` 重叠：多页 TIFF 必须由
+                // `tiff::TiffDecoder` 处理（`image` 的解码器只读第一个 IFD），
+                // 而 `raster` 那条路留作兜底 —— 专用解码器解不了（例如 IFD 链损坏）时
+                // 至少还能出第一页，而不是整份打不开。这和「NEF 与 TIFF 共用一个文件头、
+                // 互相兜底」是同一套理由。因为要 `decoder_for` 命中它，必须排在最前。
+                Box::new(tiff::TiffDecoder),
                 Box::new(raster::RasterDecoder),
                 Box::new(jxl::JxlDecoder),
                 Box::new(svg::SvgDecoder),
@@ -273,6 +306,37 @@ pub fn registry() -> &'static DecoderRegistry {
 /// 便利入口：用默认注册表解码。
 pub fn decode_path(src: &Path, limits: &DecodeLimits) -> DecodeResult<ImageData> {
     registry().decode_path(src, limits)
+}
+
+/// 多页文档：这个文件一共有多少页。
+///
+/// 只走目录、不碰像素，可以放心在后台线程里调（打开流程就是这么用的）。
+/// 不支持分页的格式、以及没有解码器的格式都返回 1 —— 「能不能打开」是另一件事，
+/// 由 [`decode_path`] 回答。
+pub fn page_count(format: ImageFormat, src: &Path) -> DecodeResult<usize> {
+    match registry().decoder_for(format) {
+        Some(decoder) => decoder.page_count(src),
+        None => Ok(1),
+    }
+}
+
+/// 多页文档：解码其中一页（`index` 从 0 开始）。
+///
+/// 按**格式**而不是按内容嗅探来挑解码器：调用方拿的是刚解出来的那份文档，
+/// 再嗅探一遍既慢又可能得出不同结论（两者的不一致是最难查的一类 bug）。
+pub fn decode_page(
+    format: ImageFormat,
+    src: &Path,
+    index: usize,
+    limits: &DecodeLimits,
+) -> DecodeResult<Frame> {
+    match registry().decoder_for(format) {
+        Some(decoder) => decoder.decode_page(src, index, limits),
+        None => Err(DecodeError::unsupported(
+            Some(format),
+            "当前构建没有这个格式的解码器，无法按页解码",
+        )),
+    }
 }
 
 /// 读取文件头。

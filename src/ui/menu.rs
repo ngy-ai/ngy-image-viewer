@@ -121,6 +121,7 @@ pub fn menu_layer(
     skin: &Skin,
     open: Option<usize>,
     has_image: bool,
+    has_pages: bool,
     preference: Preference,
     view: &Entity<ImageViewerView>,
 ) -> AnyElement {
@@ -165,7 +166,7 @@ pub fn menu_layer(
                 .mx_2()
                 .bg(skin.border)
                 .into_any_element(),
-            Entry::Item(command) => menu_item(skin, *command, has_image, preference, view),
+            Entry::Item(command) => menu_item(skin, *command, has_image, has_pages, preference, view),
         });
     }
 
@@ -197,13 +198,19 @@ fn menu_item(
     skin: &Skin,
     command: Command,
     has_image: bool,
+    has_pages: bool,
     preference: Preference,
     view: &Entity<ImageViewerView>,
 ) -> AnyElement {
-    // 两种灰是有区别的：`is_available` 假 = 这台机器上根本做不到（跨平台限制），
-    // 不会因为打开一张图而改变；`needs_image` 真且没有图 = 先打开一张图就能用。
-    // 混成一个判断会让用户分不清该「先开一张图」还是「这事在这台机器上没戏」。
-    let enabled = command.is_available() && (!command.needs_image() || has_image);
+    // 三种「不亮」是有区别的：
+    // - `is_available` 假 = 这台机器上根本做不到（跨平台限制），不会因为打开一张图而改变；
+    // - `needs_image` 真且没有图 = 先打开一张图就能用；
+    // - `needs_pages` 真而这份文件只有一页 = 这张图本来就没有别的页。
+    // 混成一个判断会让用户分不清该「先开一张图」还是「这事在这台机器上没戏」，
+    // 也看不出「灰着」其实在告诉他这份文件只有一页。
+    let enabled = command.is_available()
+        && (!command.needs_image() || has_image)
+        && (!command.needs_pages() || has_pages);
     // 皮肤三项是互斥的单选，当前生效的那个要有个「已选中」的标记。
     // 用文字标记而不是一个勾号字形：那些码位不保证在系统字体里存在，
     // 缺字时用户看到的是豆腐块（与 `maximize_glyph` 同一个理由）。

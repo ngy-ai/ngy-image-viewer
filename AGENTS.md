@@ -70,6 +70,44 @@ main.rs  →  app.rs  →  ui/  →  render/  →  model/  →  decode/
 
 `render/` 是整个项目里**唯一**同时知道「图像数据长什么样」和「GPUI 怎么画」的地方。像素格式、通道顺序、纹理上限、坐标系换算都关在这一层。
 
+### 多页文档：页 ≠ 动图（同一个 `frames` 数组的两种语义）
+
+`ImageData.frames` 被两种语义共用：**动图**的帧挂在时间轴上（自动播放），
+**多页容器**（多页 TIFF 的 IFD 链）的帧是并列的页（用户翻）。同一份数据、两种含义，
+所以每一层都要各自问清「我要的是哪一种」，**只看 `frames.len()` 一定出错**：
+
+| 层 | 问法 |
+| --- | --- |
+| `decode/types.rs` | `is_animated()` = `format.may_be_animated() && frames.len() > 1`。**格式这一维不能省**：多页 TIFF 补页之后 `frames.len()` 也大于 1，只数帧数的话打开一份 30 页的扫描件它会自己翻起来，而且用户按「下一页」永远追不上它。`may_be_animated()` 是「哪些格式的多个 frame 表示时间轴」的唯一答案，必须与 `decode/raster.rs` 的格式分派一致 |
+| `model/document.rs` | `is_paged()` = `pages > 1 && !format.may_be_animated()`；`content(index) -> Option<&Frame>` 对**未解码**的页返回 `None`，**绝不退化为第一页** |
+| `render/surface.rs` | `Textures::Frames`（一张纹理含全部帧）vs `Textures::Pages`（每页一张单帧纹理） |
+| `ui/command.rs` | `needs_pages()` 是独立于 `is_available` / `needs_image` 的**第三维**（「这张图有没有别的页」） |
+
+### 打开多页文档：先出首页、其余后台补
+
+双击打开必须在首帧就有图，所以打开路径**只解第 1 页**，其余页等用户翻过去时按需解
+（`ui/view.rs` 的 `ensure_page` / `pump_page` / `accept_page`）。由此长出三条硬约束：
+
+- **未解码的页绝不退而画别的页。** `ViewportConfig.frame_index: Option<usize>`，
+  `None` = 这一份内容还没解好，此时只铺底色、由占位层说明「正在解码第 k 页」。
+  「页码变了、画还是上一张」在画面上与「翻对了」长得一模一样，所以这条约束落在**类型**上，
+  而不是靠某处的一次判断。同理，`paint_image` 里原先那句「把帧号夹到最后一帧」的兜底
+  必须**删掉** —— 夹帧看着安全，实际是「你要第 5 页、我给你第 3 页」。
+- **每页一张单帧纹理，而不是一张多帧纹理。** `RenderImage` 构造后不可变，而它的
+  `id: ImageId` 是 GPU 上传的**缓存键**；每次补页都重建一张含全部页的纹理，
+  会让先前每一页都重新上传一次 —— 翻到第 N 页是 O(N²) 的上传量。
+  分页因此走 `Textures::Pages`，且每页按**自己的**长边算降采样倍率
+  （同一份扫描件里正文 A4、插页 A3 很常见，用第一页的倍率会让纹理超 GPU 上限）。
+- **约束可注入**：`ImageDocument.budget: PageBudget`（生产路径恒为 `default()`）。
+  测试把它调到极小，就能把「触到 512 页 / 2 GiB 上限之后界面怎么办」这条真实代码路径
+  真的走一遍，而不必造出几十 GB 内存。触到上限时 `pages` 收敛到已载入的页数，
+  免得把用户送到一个永远解不出来的页上。
+
+页号有两份，用途不同，**别混**：`frame_index` 是**用户请求的**页（页码要立刻跟着走，
+否则那几十毫秒的解码间隙里按了键看不到任何反应），`document.current_page()` 是
+**已经画得出来的**页。状态栏与画布角标用前者；`displayed_pixels()`（复制图像 / 另存为）
+用的是 `document.content(visible_index()?)` —— 与画布要画的那一份同源。
+
 ---
 
 ## 3. 皮肤（深色 / 浅色）
@@ -281,7 +319,8 @@ impl Display { /* 走 short_reason */ }
 | --- | --- |
 | `Window::paint_image(bounds, image_bounds, corner_radii, data, frame_index, grayscale)` **只接受轴对齐矩形**，整个 crate 没有公开的仿射变换入口 | **旋转与翻转必须在像素层完成**（`decode/orientation.rs`）。这换来一个好处：屏幕所见与「另存为」导出逐像素一致 |
 | `RenderImage` 的缓冲区是 `image::Frame`（RGBA 布局）但 GPU 按 **BGRA** 解释，非预乘 | 上传前必须交换红蓝通道，否则人脸变蓝 |
-| `paint_image` 会直接索引帧数组 | `frame_index` 必须先 `min(frame_count - 1)` 夹一次，否则换图时整界面 panic |
+| `RenderImage` 构造后**不可变**，它的 `id: ImageId` 是 GPU 上传的**缓存键**（`gpui-pre-0.3.4/src/assets.rs`） | 想「往已有纹理里再加一帧」只能重建一张新的，而新 `id` 意味着整张重新上传。多页文档因此**每页一张单帧纹理**（`Textures::Pages`），不是一张多帧纹理 |
+| `RenderImage::as_bytes(i)` / `size(i)` 对越界帧号返回 `None` / 默认值，**不 panic**；`paint_image` 对越界帧号也不 panic（帧数为 0 时直接 return） | 先前那条「`frame_index` 必须先 `min(frame_count - 1)` 夹一次，否则换图时整界面 panic」**经核实不成立**，那句兜底已经删掉：在翻页场景里夹帧就是「你要第 5 页、我给你第 3 页」。取不到纹理就不要画，让占位层去说明 |
 | `image_bounds` 是「整张图在窗口里的矩形」，GPUI 用 `bounds ∩ image_bounds` 反算纹理子区域 | 画整张图时两个参数传**同一个**矩形；传「已裁剪过」的矩形会让纹理坐标映射出错 |
 | `Pixels` 的字段是私有的 | 用 `f32::from(pixels)`，不能 `.0` |
 | `canvas(prepaint, paint)` 的 `prepaint` 是唯一能拿到画布真实尺寸的地方，且它是 `'static` 闭包 | 尺寸要靠共享槽位（`render/viewport.rs` 的 `ViewportSlot`）回传给视图 |
@@ -338,11 +377,11 @@ impl Display { /* 走 short_reason */ }
 
 ## 9. 测试约定
 
-168 项，分三层：
+259 项，分三层：
 
 | 位置 | 关注点 |
 | --- | --- |
-| 各模块内的 `#[cfg(test)] mod tests` | 纹理构建、去马赛克、方向代数、文件操作、输入换算、菜单与快捷键表 |
+| 各模块内的 `#[cfg(test)] mod tests` | 纹理构建、去马赛克、方向代数、文件操作、输入换算、菜单与快捷键表、多页文档（页 ≠ 动图、页数与内存上限的收敛、每页按自身尺寸建纹理、`goto_page` 只在已解码时成功、`content()` 不给退化值） |
 | `tests/decode_test.rs` | 格式判定以内容为准、损坏文件不崩、超大图在分配前被拒、动图帧与延迟不丢、缺解码器时给可操作提示 |
 | `tests/transform_test.rs` | 缩放锚点不变性（含连续缩放不漂移）、1:1 在高分屏的含义、平移边界、方向复合与像素实现 8×8 全对齐 |
 
@@ -423,3 +462,20 @@ impl Display { /* 走 short_reason */ }
    它会先备份、再写入、最后无条件清理；判据用 `AssocQueryStringW`（系统实际会用哪个 exe），
    而不是「注册表里写了什么」—— 后者会把「写了但被 UserChoice 压住」误判成成功。
    `assoc_probe.py` 是它的只读版（只定位面板、不改注册表），改界面布局时用它。
+7. **碰了翻页 / 多页文档，单测不够** —— 它牵涉键盘分发、菜单可用性、后台解码、纹理追加
+   与「画布到底画了哪一份」四件事，只有真机跑一遍才算验证：
+   ```bash
+   python .workbuddy/scripts/verify_multipage.py
+   ```
+   判据**不是截图**：本机可能根本没有交互桌面（`GetForegroundWindow()` 返回 0、
+   `OpenInputDesktop()` 返回 0 / err=5、`PrintWindow` 一律返回 0），此时任何 GDI 取像素
+   的方案都无解。改用两条别的通道（细节见 `gpui-gui-automation` 技能）：
+   - **程序日志**（`NGY_TRACE=1`，主力）：`文档就绪…已解页数=1 总页数=3`、
+     `第 N 页已就绪（已解码 x/y）`、`paint_image…内容序号=N/M 纹理内帧号=0 纹理尺寸=…`。
+     后两条是「画布真的换到了那一页」与「每页一张单帧纹理」的直接证据 ——
+     `paint.*` 的打点 key 里带内容序号，正是为了翻页之后日志不会变成一片沉默。
+   - **剪贴板**（给真像素）：菜单「编辑 → 复制图像」把 `displayed_pixels()` 放进剪贴板，
+     再把 DIB 读回来数颜色（`CF_DIBV5`，`BITMAPV5HEADER` 124 字节、32bpp、BI_BITFIELDS）。
+     **不要走 `Ctrl+C`**：GPUI 用 `GetKeyState` 判修饰键，看不见投递的
+     `WM_KEYDOWN VK_CONTROL`（已实测），投递过的「Ctrl+C」只是个普通的 `c`。
+     剪贴板也不会随翻页自动更新，每读一页都要重新走一次菜单。

@@ -26,10 +26,14 @@ pub const APP_NAME: &str = "ngy-image-viewer";
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Command {
     Open,
-    /// 同目录里的上一个图片（↑）。
+    /// 同目录里的上一个图片（↑ / ←）。
     PreviousFile,
-    /// 同目录里的下一个图片（↓）。
+    /// 同目录里的下一个图片（↓ / →）。
     NextFile,
+    /// 多页文档里的上一页（PageUp）。单页文档里没有意义。
+    PreviousPage,
+    /// 多页文档里的下一页（PageDown）。
+    NextPage,
     SaveAs,
     Rename,
     DeleteToTrash,
@@ -62,6 +66,8 @@ impl Command {
             Self::Open => "打开…",
             Self::PreviousFile => "上一个文件",
             Self::NextFile => "下一个文件",
+            Self::PreviousPage => "上一页",
+            Self::NextPage => "下一页",
             Self::SaveAs => "另存为…",
             Self::Rename => "重命名…",
             Self::DeleteToTrash => "移到回收站",
@@ -102,6 +108,16 @@ impl Command {
                 | Self::AssociateFormats
                 | Self::Quit
         )
+    }
+
+    /// 是否只在**多页文档**里才有意义。
+    ///
+    /// 与 [`needs_image`](Self::needs_image) 是独立的一维：那个问「现在有没有图」，
+    /// 这个问「这张图有没有别的页」。混进一个判断会让单页图片上的「下一页」
+    /// 也亮着 —— 点下去什么都不发生，比灰着更让人困惑；而「灰色」在这里
+    /// 恰好是一个有用的信息：这份文件就一页。
+    pub fn needs_pages(self) -> bool {
+        matches!(self, Self::PreviousPage | Self::NextPage)
     }
 
     /// 当前平台上这个动作做不做得到。
@@ -209,6 +225,12 @@ pub const MENUS: &[Menu] = &[
     Menu {
         label: "视图",
         entries: &[
+            // 翻页放在最前：一份 30 页的扫描件打开之后，用户接下来要做的事就是往下翻。
+            // 这两项只在多页文档里才亮（见 `Command::needs_pages`）——
+            // 单页图片上它们灰着，那本身也是「这份文件只有一页」的一个说明。
+            Entry::Item(Command::PreviousPage),
+            Entry::Item(Command::NextPage),
+            Entry::Separator,
             Entry::Item(Command::FitToWindow),
             Entry::Item(Command::ActualSize),
             Entry::Separator,
@@ -264,22 +286,42 @@ pub const KEY_BINDINGS: &[Binding] = &[
         display: "O",
         command: Command::Open,
     },
-    // 上下方向键 = 同目录导航。这是看图器的本能操作：看第一张之前手已经
-    // 放在了方向键上，所以不带任何修饰键。邻居列表在后台线程里异步准备，
-    // 没就绪时按下会有提示（见 view.rs 的 open_neighbor）。
+    // 方向键 = 同目录导航，上下与左右四个键都认。这是看图器的本能操作：看第一张
+    // 之前手已经放在了方向键上，所以不带任何修饰键。两对方向键是**并存**而不是
+    // 谁取代谁 —— 竖着看图时手习惯按上下，横排版式与单手操作时习惯按左右；
+    // 砍掉一半只会让那一半人的肌肉记忆失灵，而代价只是 `keys` 里多一个键名。
+    // 邻居列表在后台线程里异步准备，没就绪时按下会有提示（见 view.rs 的 open_neighbor）。
     Binding {
-        keys: &["up"],
+        keys: &["up", "left"],
         control: false,
         shift: false,
-        display: "↑",
+        display: "↑ / ←",
         command: Command::PreviousFile,
     },
     Binding {
-        keys: &["down"],
+        keys: &["down", "right"],
         control: false,
         shift: false,
-        display: "↓",
+        display: "↓ / →",
         command: Command::NextFile,
+    },
+    // 翻页与换文件是两条独立的轴，所以用两对不同的键：方向键换文件，
+    // PageUp / PageDown 翻页。合并成一个动作会把「看下一张图」与
+    // 「看这份扫描件的下一页」混为一谈，而这两件事的期待完全不同 ——
+    // 前者要换掉整份文档，后者只是同一份文档的下一页。
+    Binding {
+        keys: &["pageup"],
+        control: false,
+        shift: false,
+        display: "PageUp",
+        command: Command::PreviousPage,
+    },
+    Binding {
+        keys: &["pagedown"],
+        control: false,
+        shift: false,
+        display: "PageDown",
+        command: Command::NextPage,
     },
     Binding {
         keys: &["s"],
@@ -472,6 +514,31 @@ mod tests {
         assert_eq!(command_for_keystroke("_", false, true), Some(Command::ZoomOut));
     }
 
+    /// 同目录导航四个方向键都通：上下与左右是同一对动作的两个入口。
+    ///
+    /// 这条断言把「四个键都认」钉死，防的是将来有人把左右当成「冗余别名」删掉 ——
+    /// 删掉的后果不会表现在编译期，而是某天有人横着看图时按了左右、画面毫无反应，
+    /// 然后去怀疑邻居列表坏了。
+    #[test]
+    fn both_horizontal_and_vertical_arrows_navigate_neighbors() {
+        assert_eq!(
+            command_for_keystroke("up", false, false),
+            Some(Command::PreviousFile)
+        );
+        assert_eq!(
+            command_for_keystroke("left", false, false),
+            Some(Command::PreviousFile)
+        );
+        assert_eq!(
+            command_for_keystroke("down", false, false),
+            Some(Command::NextFile)
+        );
+        assert_eq!(
+            command_for_keystroke("right", false, false),
+            Some(Command::NextFile)
+        );
+    }
+
     #[test]
     fn no_two_bindings_claim_the_same_keystroke() {
         let mut seen: Vec<(&str, bool, bool)> = Vec::new();
@@ -636,6 +703,35 @@ mod tests {
         }
         let labels: Vec<&str> = MENUS.iter().map(|menu| menu.label).collect();
         assert_eq!(labels, vec!["文件", "编辑", "视图", "工具"]);
+    }
+
+    /// 翻页命令必须真的绑在 PageUp / PageDown 上，且只在多页文档里才有意义。
+    ///
+    /// 「需要翻页」与「需要图片」是两维：混在一起会让单页图片上的「下一页」
+    /// 也亮着 —— 点下去什么都不发生，比灰着更让人困惑。
+    #[test]
+    fn page_commands_are_bound_to_page_keys_and_need_a_paged_document() {
+        assert_eq!(
+            command_for_keystroke("pageup", false, false),
+            Some(Command::PreviousPage)
+        );
+        assert_eq!(
+            command_for_keystroke("pagedown", false, false),
+            Some(Command::NextPage)
+        );
+        // 带修饰键时不该触发：翻页是全键盘里最不该跟 Ctrl 组合的动作。
+        assert_eq!(command_for_keystroke("pagedown", true, false), None);
+
+        for command in menu_commands() {
+            let expected = matches!(command, Command::PreviousPage | Command::NextPage);
+            assert_eq!(command.needs_pages(), expected, "{command:?}");
+            if expected {
+                assert!(
+                    command.needs_image(),
+                    "{command:?} 说的是「这张图的下一页」，当然要先有图"
+                );
+            }
+        }
     }
 
     /// 「工具」菜单只放程序自身的设置，不放作用于当前图片的动作。

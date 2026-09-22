@@ -281,6 +281,10 @@ xdg-mime default ngy-image-viewer.desktop image/png image/jpeg image/gif image/w
 | `H` | 水平翻转 |
 | `V` | 垂直翻转 |
 | `I` | 显示 / 隐藏 EXIF 信息面板 |
+| `↑` / `←` | 同目录里的上一个图片（到头后绕回最后一张） |
+| `↓` / `→` | 同目录里的下一个图片（到头后绕回第一张） |
+| `PageUp` | 多页文档的上一页（单页图片上无反应，菜单里也是灰的） |
+| `PageDown` | 多页文档的下一页（同上） |
 | `Ctrl + C` | 复制当前显示的图像到剪贴板 |
 | `Ctrl + S` | 另存为 |
 
@@ -328,7 +332,7 @@ xdg-mime default ngy-image-viewer.desktop image/png image/jpeg image/gif image/w
 
 | 分类 | 格式 | 备注 |
 | --- | --- | --- |
-| 栅格 | PNG、JPEG、GIF、BMP、WebP、TIFF、ICO、PNM、TGA、DDS、HDR、EXR、QOI、Farbfeld | 多帧 GIF / APNG / 动画 WebP 完整播放；DDS 见下方说明 |
+| 栅格 | PNG、JPEG、GIF、BMP、WebP、TIFF、ICO、PNM、TGA、DDS、HDR、EXR、QOI、Farbfeld | 多帧 GIF / APNG / 动画 WebP 完整播放；**多页 TIFF 可逐页浏览**（打开时先出第 1 页，其余页在翻到时后台解码，`PageUp` / `PageDown` 或「视图」菜单翻页）；DDS 见下方说明 |
 | 矢量 | SVG、SVGZ（gzip 压缩的 SVG） | 光栅化到声明尺寸的 8 倍（上限 1600 长边），放大时依然清晰 |
 | 现代格式 | JPEG XL（`.jxl`，两种封装都支持） | 单帧 |
 | 系统原生 | HEIC / HEIF | **仅 Windows**；需系统「HEIF 图像扩展」 |
@@ -406,7 +410,7 @@ Get-Content target\bench\perf.log
 3. **文件夹导航与相邻图片预加载未实现**：一次只看一张。
 4. **macOS / Linux 的 HEIC 与 AVIF 未接入**（第三节的表格与应用内的提示都会说明这一点）。
 5. **macOS / Linux 构建未实测**——见开头「平台支持状态」。
-6. **界面没有做过交互式的逐项验证**。启动路径是靠打点确认的（首帧带图、无 panic），解码与视图变换是靠 168 项测试确认的；但「拖动进度、滚轮手感、按钮悬停、文件拖入、菜单展开与窗口按钮」这类需要真实鼠标键盘的操作，只做过编译期与逻辑层的验证，没有在窗口里逐一点过。如果你发现某处手感不对，那大概率是这些地方之一。
+6. **界面没有做过交互式的逐项验证**。启动路径是靠打点确认的（首帧带图、无 panic），解码与视图变换是靠 259 项测试确认的，**多页翻页另有一遍真机闭环**（键盘 `PageUp` / `PageDown`、「视图」菜单点击、补页期间只铺底色不画别的页、末页不越界、每页按自身尺寸建纹理，脚本见 `.workbuddy/scripts/verify_multipage.py`）；但「拖动进度、滚轮手感、按钮悬停、文件拖入、菜单展开与窗口按钮」这类需要真实鼠标键盘的操作，只做过编译期与逻辑层的验证，没有在窗口里逐一点过。如果你发现某处手感不对，那大概率是这些地方之一。
 7. **没有像素级的视觉回归测试**：配色与排版按设计规范实现，没有截图对比。
 
 ---

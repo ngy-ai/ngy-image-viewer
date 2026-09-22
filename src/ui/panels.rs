@@ -229,9 +229,16 @@ where
 ///
 /// 提示语只留三条最常用的：状态栏是**唯一**常驻的说明位，而快捷键一多就没人看了
 /// （完整清单在「视图」菜单的快捷键提示里，那里按需展开）。
+/// 底部状态栏。
+///
+/// `page` 是页码 `(当前, 总数)`；不分页的格式传 `None`，那一段整段不画。
+/// 它由调用方给出，而不是这里从文档里取：多页文档里「请求的页」与「已画出的页」
+/// 会在补页的几十毫秒里不一致，而状态栏要显示的是**请求的**那一页 ——
+/// 否则用户按下翻页键，状态栏毫无反应，看起来像没生效。
 pub fn status_bar(
     skin: &Skin,
     document: Option<&ImageDocument>,
+    page: Option<(usize, usize)>,
     zoom_percent: f32,
 ) -> impl IntoElement {
     let (size_text, format_text, bytes_text) = match document {
@@ -250,6 +257,20 @@ pub fn status_bar(
         .map(|document| duration_text(document.decode_ms()))
         .unwrap_or_default();
 
+    // 页码紧跟格式名：它回答的是「这份文件里我现在在哪」，
+    // 与格式、尺寸、大小同属一组「这张图是什么样」的信息。
+    let mut leading = div()
+        .flex()
+        .flex_row()
+        .items_center()
+        .gap_3()
+        .child(size_text)
+        .child(format_text);
+    if let Some((current, total)) = page {
+        leading = leading.child(format!("第 {current} / {total} 页"));
+    }
+    let leading = leading.child(bytes_text).child(zoom_text(zoom_percent));
+
     div()
         .flex()
         .flex_row()
@@ -263,17 +284,7 @@ pub fn status_bar(
         .border_color(hairline(skin))
         .text_size(px(11.0))
         .text_color(skin.text_faint)
-        .child(
-            div()
-                .flex()
-                .flex_row()
-                .items_center()
-                .gap_3()
-                .child(size_text)
-                .child(format_text)
-                .child(bytes_text)
-                .child(zoom_text(zoom_percent)),
-        )
+        .child(leading)
         .child(
             div()
                 .flex()
