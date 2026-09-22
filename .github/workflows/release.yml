@@ -218,6 +218,36 @@ jobs:
           path: dist/*
           if-no-files-found: error
 
+      # Linux 上失败时补一份环境现场。
+      #
+      # 「编译不过」「系统库缺一个 .so」「被 OOM killer 干掉」这三件事在 cargo 的输出
+      # 里长得完全不一样，却都只是同一个 exit code 101；而第一轮 Linux 的失败信息
+      # 一直没读到。把现场一起存下来，下一轮就能直接分流，不必靠猜。
+      - name: 失败时补一份环境现场（Linux）
+        if: failure() && matrix.platform == 'linux'
+        shell: bash
+        run: |
+          {
+            echo "===== 编译器 ====="
+            rustc -vV
+            cargo -vV
+            echo "===== pkg-config 里对得上的包 ====="
+            for p in fontconfig freetype2 wayland-client xkbcommon xkbcommon-x11 xcb x11 libopenjp2; do
+              printf '%-16s ' "$p"
+              pkg-config --modversion "$p" 2>/dev/null || echo "(缺)"
+            done
+            echo "===== 关键 .so 在不在 ====="
+            ls /usr/lib/x86_64-linux-gnu/ 2>/dev/null \
+              | grep -E '^lib(xkbcommon|fontconfig|freetype|wayland|openjp2|vulkan)' \
+              || echo "(一个都没匹配到)"
+            echo "===== 资源 ====="
+            free -h
+            df -h /
+            echo "===== 有没有被 OOM 杀掉 ====="
+            sudo dmesg 2>/dev/null | grep -iE 'killed process|out of memory' | tail -20 \
+              || echo "(读不到 dmesg)"
+          } 2>&1 | tee -a ci-output.txt
+
       # 失败时把输出推到 `ci-log/<平台>-<架构>` 分支。
       #
       # 为什么不用 Actions 日志：`GET /actions/jobs/{id}/logs` 对未认证请求一律 403。
