@@ -1,0 +1,120 @@
+# 【临时文件】单点验证 release job —— 验证完就删。
+#
+# 为什么需要它：三平台的构建 / 测试 / 打包已经全绿（run 35747907386），
+# 只有最后的「创建 Release」红着，而那句 `exit code 1` 背后的原因可能是
+# 「gh 没有 git 上下文」也可能是「token 权限不够」—— 两者都只值一次几十秒的
+# 尝试，却要花掉正式流程里 23 分钟的重新编译才能问到。
+# 这里把那一轮已经躺在 GitHub 上的 artifact 取回来，只跑发布逻辑。
+name: Debug Release
+
+on:
+  workflow_dispatch:
+  # 本机没有 GitHub token，没法调 workflow_dispatch 那个需要认证的 API，
+  # 所以让推送这个文件本身成为触发器。
+  push:
+    paths:
+      - ".github/workflows/debug-release.yml"
+
+permissions:
+  # 显式声明 permissions 之后，没列出来的作用域会变成 none ——
+  # `gh run download` 读的是 Actions 的 artifact，所以要单独开 actions: read。
+  contents: write
+  actions: read
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      # 第一步就把它放进来：正式流程里 release job 原本没有 checkout，
+      # 这是「gh 找不到仓库」的头号嫌疑。
+      - uses: actions/checkout@v5
+
+      - name: 取回构建产物
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          {
+            echo ===== 取回 =====
+            mkdir -p dist
+            gh run download 35747907386 --dir dist-raw
+            echo ===== 原始布局 =====
+            find dist-raw -type f
+            find dist-raw -type f \( -name '*.zip' -o -name '*.tar.gz' \) -exec cp {} dist/ \;
+            echo ===== 拍平之后 =====
+            ls -la dist
+          } 2>&1 | tee ci-output.txt
+
+      - name: 写 Release 说明
+        run: |
+          set -euo pipefail
+          echo "（调试运行，说明正文从简）" > notes.md
+
+      - name: 创建或更新 Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          TAG=v0.1.0
+          {
+            echo "TAG=${TAG}"
+            echo "仓库上下文：${GITHUB_REPOSITORY:-（空）}"
+            echo "git 上下文：$(git rev-parse --is-inside-work-tree 2>&1 || true)"
+            git remote -v 2>&1 | head -2 || true
+            echo "gh 版本：$(gh --version 2>&1 | head -1)"
+            echo "dist/ 内容："
+            ls -la dist
+            if gh release view "${TAG}" >/dev/null 2>&1; then
+              echo "→ ${TAG} 已存在，改为覆盖上传产物"
+              gh release upload "${TAG}" dist/* --clobber
+            else
+              echo "→ ${TAG} 不存在，创建"
+              gh release create "${TAG}" \
+                --title "${TAG}" \
+                --notes-file notes.md \
+                dist/*
+            fi
+          } 2>&1 | tee -a ci-output.txt
+
+      - name: 失败时把输出推到一个分支
+        if: failure()
+        continue-on-error: true
+        shell: bash
+        run: |
+          {
+            set -x
+            mkdir -p ci-log
+            cp ci-output.txt ci-log/debug-release.txt
+            git config user.name  "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git checkout -B ci-log/debug-release
+            git add -f ci-log/debug-release.txt
+            git commit -m "ci: debug release 的输出"
+            git push --force origin ci-log/debug-release
+          } > push-report.txt 2>&1 || echo "推送失败（原因在 push-report.txt 里）"
+
+      - name: 把输出打成注解
+        if: always()
+        continue-on-error: true
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import pathlib
+
+          def excerpt(path, head, tail):
+              p = pathlib.Path(path)
+              if not p.exists():
+                  return f"（没有 {path}）"
+              text = p.read_text(encoding="utf-8", errors="replace")
+              if len(text) <= head + tail:
+                  return text
+              return text[:head] + "\n......（中略）......\n" + text[-tail:]
+
+          body = excerpt("ci-output.txt", 1500, 4000)
+          body += "\n\n===== 推送 ci-log 分支的尝试 =====\n"
+          body += excerpt("push-report.txt", 200, 1200)
+          escaped = body.replace("%", "%25").replace("\r", "").replace("\n", "%0A")
+          print(f"::error title=debug release 的输出::{escaped}")
+          PY

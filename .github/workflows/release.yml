@@ -352,6 +352,14 @@ jobs:
     if: startsWith(github.ref, 'refs/tags/')
     runs-on: ubuntu-latest
     steps:
+      # gh 要能回答「往哪个仓库发 Release」。它优先读 git remote，而一个没有
+      # `.git` 的工作目录给不出任何答案 —— 第一轮 release job 就红在这里，
+      # 日志里只留下一句 `exit code 1`。取一份仓库下来只要几秒，不编译任何东西，
+      # 比依赖 GH_REPO 环境变量兜底更不容易在某天悄悄退化。
+      # 必须在 download-artifact **之前**：checkout 默认会清理工作目录，
+      # 反过来会把刚取回来的 dist/ 删掉。
+      - uses: actions/checkout@v5
+
       - name: 取回全部平台的产物
         uses: actions/download-artifact@v4
         with:
@@ -362,13 +370,15 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          ls -la dist
+          # 全程留痕：这个 job 一旦红了，evidence 只有这里写下的东西。
+          ls -la dist | tee ci-output.txt
           # 四个包（Windows / macOS 两个架构 / Linux）少一个就不发 ——
           # 一个「只挂了一半产物」的 Release 比没有 Release 更容易误导人。
           # `|| true` 是必须的：grep -c 在零匹配时退出码是 1，配合 set -e 会让
           # 脚本在报出真正的原因之前就死掉。
           expected=4
           actual="$(ls -1 dist | grep -cE '\.(zip|tar\.gz)$' || true)"
+          echo "产物计数：${actual} / ${expected}" | tee -a ci-output.txt
           if [[ "${actual}" -lt "${expected}" ]]; then
             echo "::error::只找到 ${actual} 个产物，期望 ${expected} 个"
             exit 1
@@ -419,14 +429,81 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAG: ${{ github.ref_name }}
+        shell: bash
         run: |
           set -euo pipefail
-          # 幂等：CI 失败重跑、或 tag 被推倒重来时不至于卡在「release 已存在」。
-          if gh release view "${TAG}" >/dev/null 2>&1; then
-            gh release upload "${TAG}" dist/* --clobber
-          else
-            gh release create "${TAG}" \
-              --title "${TAG}" \
-              --notes-file notes.md \
-              dist/*
-          fi
+          # 整个 gh 调用包在花括号里 tee 出去：失败原因（403 的原文、缺哪个参数）
+          # 只在 stderr 里出现一次，不落盘就什么都读不到。
+          # `set -o pipefail` 保证 gh 的退出码能穿过管道传出来。
+          {
+            echo "TAG=${TAG}"
+            echo "仓库上下文：${GITHUB_REPOSITORY:-（空）}"
+            echo "git 上下文：$(git rev-parse --is-inside-work-tree 2>&1 || true)"
+            git remote -v 2>&1 | head -2 || true
+            echo "gh 版本：$(gh --version 2>&1 | head -1)"
+            echo "dist/ 内容："
+            ls -la dist
+            # 幂等：CI 失败重跑、或 tag 被推倒重来时不至于卡在「release 已存在」。
+            if gh release view "${TAG}" >/dev/null 2>&1; then
+              echo "→ ${TAG} 已存在，改为覆盖上传产物"
+              gh release upload "${TAG}" dist/* --clobber
+            else
+              echo "→ ${TAG} 不存在，创建"
+              gh release create "${TAG}" \
+                --title "${TAG}" \
+                --notes-file notes.md \
+                dist/*
+            fi
+          } 2>&1 | tee -a ci-output.txt
+
+      # 与 build job 同一条通道，理由见那边的注释：未认证的
+      # `GET /actions/jobs/{id}/logs` 一律 403，而 `git fetch` 不要凭据、不占 API 配额。
+      - name: 失败时把输出推到一个分支
+        if: failure()
+        continue-on-error: true
+        shell: bash
+        run: |
+          {
+            set -x
+            if [ ! -f ci-output.txt ]; then
+              echo "没有捕获到输出（失败发生在 tee 之前）"
+              exit 0
+            fi
+            mkdir -p ci-log
+            cp ci-output.txt ci-log/release.txt
+            git config user.name  "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git checkout -B ci-log/release
+            git add -f ci-log/release.txt
+            git commit -m "ci: 创建 Release 的失败输出"
+            git push --force origin ci-log/release
+          } > push-report.txt 2>&1 || echo "推送失败（原因在 push-report.txt 里）"
+
+      - name: 失败时把输出打成注解
+        if: failure()
+        # 与 build job 同理：这一步自己红了会盖住真正失败的那一步。
+        continue-on-error: true
+        shell: bash
+        run: |
+          # ubuntu runner 自带 python3；这里不依赖 setup-python（build job 才有那一步）。
+          python3 - <<'PY'
+          import pathlib
+
+          def excerpt(path, head, tail):
+              p = pathlib.Path(path)
+              if not p.exists():
+                  return f"（没有 {path}）"
+              text = p.read_text(encoding="utf-8", errors="replace")
+              if len(text) <= head + tail:
+                  return text
+              return text[:head] + "\n......（中略）......\n" + text[-tail:]
+
+          body = excerpt("ci-output.txt", 1500, 6000)
+          # 推送日志分支那一步的尝试也带上 —— 它自己不再让 job 变红，
+          # 这里就是唯一能看到「为什么没推上去」的地方。
+          body += "\n\n===== 推送 ci-log 分支的尝试 =====\n"
+          body += excerpt("push-report.txt", 200, 1500)
+
+          escaped = body.replace("%", "%25").replace("\r", "").replace("\n", "%0A")
+          print(f"::error title=创建 Release 的输出::{escaped}")
+          PY
