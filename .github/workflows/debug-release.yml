@@ -47,11 +47,47 @@ jobs:
           } 2>&1 | tee ci-output.txt
 
       - name: 写 Release 说明
+        env:
+          TAG: v0.1.0
         run: |
           set -euo pipefail
-          echo "（调试运行，说明正文从简）" > notes.md
+          cat > notes.md <<'NOTES'
+          ## 下载
 
-      - name: 创建或更新 Release
+          | 平台 | 文件 | 说明 |
+          | --- | --- | --- |
+          | Windows 10 / 11 | `ngy-image-viewer-__TAG__-x86_64-windows.zip` | 解压即用。已静态链接 CRT，不需要装 VC++ 运行库 |
+          | macOS（Apple Silicon） | `ngy-image-viewer-__TAG__-arm64-macos.zip` | 解压后把 `ngy-image-viewer.app` 拖进「应用程序」 |
+          | macOS（Intel） | `ngy-image-viewer-__TAG__-x86_64-macos.zip` | 同上，按机器架构各取所需 |
+          | Linux x86_64 | `ngy-image-viewer-__TAG__-x86_64-linux.tar.gz` | 解压后把二进制放进 `PATH`，再把包里的 `.desktop` 装到 `~/.local/share/applications/` |
+
+          ### 首次打开可能被系统拦下
+
+          - **macOS**：这些包**没有签名、也没有公证**（那需要付费的 Apple Developer 账号）。
+            首次打开请**右键 →「打开」**，或执行
+            `xattr -dr com.apple.quarantine /Applications/ngy-image-viewer.app`。
+            直接双击会被 Gatekeeper 提示「无法验证开发者」。
+          - **Windows**：SmartScreen 可能提示「Windows 已保护你的电脑」，
+            点「更多信息 → 仍要运行」。exe 的属性 →「详细信息」里有版本信息可核对。
+
+          ### 系统要求
+
+          - macOS **15 或更高**（gpui-kit 0.6 的要求）
+          - Linux 需要图形环境（X11 或 Wayland）与 Vulkan / OpenGL 驱动
+          - HEIC / AVIF：Windows 走系统 WIC（缺「HEIF 图像扩展」时会给出安装指引）；
+            macOS / Linux **尚未接入**，会返回一条明确的提示而不是静默失败
+
+          ### 已知限制
+
+          macOS 与 Linux 的构建与运行来自 CI 的首次实测 —— 在此之前本项目从未在这两个
+          系统上编过。遇到问题请带上系统版本与复现步骤提 issue。
+
+          完整说明、支持的格式清单，以及手工把格式关联到本程序的步骤，见仓库 README。
+          NOTES
+          sed -i "s/__TAG__/${TAG}/g" notes.md
+          head -5 notes.md
+
+      - name: 诊断并发布
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         shell: bash
@@ -59,18 +95,22 @@ jobs:
           set -euo pipefail
           TAG=v0.1.0
           {
-            echo "TAG=${TAG}"
-            echo "仓库上下文：${GITHUB_REPOSITORY:-（空）}"
-            echo "git 上下文：$(git rev-parse --is-inside-work-tree 2>&1 || true)"
-            git remote -v 2>&1 | head -2 || true
-            echo "gh 版本：$(gh --version 2>&1 | head -1)"
-            echo "dist/ 内容："
+            echo "===== 现在是什么状态 ====="
+            gh release view "${TAG}" --json isDraft,isPrerelease,tagName,url,createdAt,publishedAt 2>&1 \
+              || echo "(view 返回非零)"
+            echo "===== 列表（含 draft）====="
+            gh release list --limit 10 2>&1 || true
+            echo "===== dist/ ====="
             ls -la dist
+            echo
+            echo "===== 发布 ====="
             if gh release view "${TAG}" >/dev/null 2>&1; then
-              echo "→ ${TAG} 已存在，改为覆盖上传产物"
+              # 删 tag 再重推会把 Release 打回 draft —— GitHub 在 tag 消失的那个窗口里
+              # 就这么做了。而 draft 在匿名 API 与 Releases 页面上都看不见：
+              # 每一步都成功、外面却什么都没有。--draft=false 是这行存在的全部理由。
+              gh release edit "${TAG}" --draft=false --title "${TAG}" --notes-file notes.md
               gh release upload "${TAG}" dist/* --clobber
             else
-              echo "→ ${TAG} 不存在，创建"
               gh release create "${TAG}" \
                 --title "${TAG}" \
                 --notes-file notes.md \

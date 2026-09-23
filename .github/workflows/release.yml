@@ -446,10 +446,12 @@ jobs:
             # 幂等：CI 失败重跑、或 tag 被推倒重来时不至于卡在「release 已存在」。
             if gh release view "${TAG}" >/dev/null 2>&1; then
               echo "→ ${TAG} 已存在，更新说明并覆盖上传产物"
-              # 说明也要一起换掉：只换产物的话，「已存在」的那个 Release 会一直
-              # 挂着上一版（或某次调试留下的）正文 —— 产物是新的、说明是旧的，
-              # 比缺说明更容易误导。
-              gh release edit "${TAG}" --title "${TAG}" --notes-file notes.md
+              # `--draft=false` 不是可有可无的：删掉 tag 再重推时，GitHub 会在
+              # tag 消失的那个窗口里把 Release 打回 draft，而 draft 在匿名 API
+              # 与 Releases 页面上**都看不见** —— 于是每一步都成功、外面却什么都没有。
+              # 说明也要一起换掉：只换产物的话，正文会一直停在上一版 ——
+              # 产物是新的、说明是旧的，比缺说明更容易误导。
+              gh release edit "${TAG}" --draft=false --title "${TAG}" --notes-file notes.md
               gh release upload "${TAG}" dist/* --clobber
             else
               echo "→ ${TAG} 不存在，创建"
