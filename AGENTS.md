@@ -515,8 +515,10 @@ git tag v0.1.0 && git push origin v0.1.0     # 触发 .github/workflows/release.
 
 - **tag 与 `Cargo.toml` 的版本号必须一致**，CI 会硬失败。不校验的话会产出
   「文件名写着 A、exe 资源段里写着 B」的包 —— 这种错只有用户来问的时候才会发现。
-- Release 步骤是**幂等**的（`gh release view` 存在就改成 `upload --clobber`），
-  CI 失败重跑或 tag 推倒重来都不会卡在「release 已存在」。
+- Release 步骤是**幂等**的（`gh release view` 存在就 `release edit` 更新说明 +
+  `upload --clobber` 换产物），CI 失败重跑或 tag 推倒重来都不会卡在「release 已存在」。
+  说明也要一起换：只换产物的话，正文会一直停在上一版 —— **产物是新的、说明是旧的**，
+  比缺说明更容易误导。
 - 产物**少一个就不发**：一个只挂了一半产物的 Release 比没有 Release 更容易误导人。
 - 手动触发（`workflow_dispatch`）只构建、留 artifact，**不创建 Release** ——
   验证新平台能不能编过时用它，不会污染 Releases。
@@ -578,6 +580,45 @@ PYTHONIOENCODING=cp1252 python packaging/package.py --platform windows …
 路径），两次都没用。真正让人走出来的是**把「解释器到底是哪个」也打出来** ——
 那行 `PATH 里的 python：/c/hostedtoolcache/…` 直接证伪了那个假设。
 诊断信息要打在**假设的旁边**，否则它只能证明你已经相信的事。
+
+### 第四个根因：release job 也需要一个 git 上下文
+
+三个平台的构建 / 测试 / 打包全绿，只有最后的「创建 Release」红着，而能读到的唯一
+信息是一句 `exit code 1`。原因：那个 job 当时**没有** `actions/checkout`，而 `gh`
+得能回答「往哪个仓库发 Release」—— 它优先读 git remote，一个没有 `.git` 的工作目录
+给不出任何答案。
+
+两处改动缺一不可：
+
+- release job 补 `actions/checkout@v5`，放在 `download-artifact` **之前**：
+  checkout 默认会清理工作目录，反过来会把刚取回来的 `dist/` 删掉。
+- 「创建或更新 Release」的整段输出 `tee` 到 `ci-output.txt`，失败时与 build job
+  走同一条 `ci-log/release` 分支 —— 403 的原文、缺哪个参数都只在 stderr 里出现一次。
+
+**更该记住的是验证方式。** 这个 job 只跑几十秒，却挂在一条 23 分钟的四平台构建后面，
+重推一次 tag 等于为了试一行命令付整轮编译的代价。所以先用一个临时的
+`debug-release.yml`（`gh run download <上一轮 run id>` 把已经躺在 GitHub 上的 artifact
+取回来）把发布逻辑单点跑通，确认「Release 建得出来、四个包挂得上去」，再让正式流程
+跑一遍做端到端确认。**能单独验的那一段，就别跟不能单独验的部分捆在一起重跑。**
+
+### 删 tag 重推会把 Release 打回 draft
+
+调试发布流程时几乎一定会做「删掉 tag、重打到新提交、再推」。这中间有个窗口里
+tag 是不存在的，GitHub 会顺手把对应的 Release 打回 **draft** —— 而 draft 在匿名 API
+与 Releases 页面上**都看不见**。于是出现了最难自查的一种状态：
+
+> 五个 job 全绿、每一步都成功，而外面什么都没有。
+
+`gh release view` 是带 token 的，它看得见 draft，所以幂等分支会正常走进
+`gh release edit` + `upload --clobber`，但那里**不会**顺带取消 draft 状态 ——
+`--draft=false` 必须显式写：
+
+```bash
+gh release edit "${TAG}" --draft=false --title "${TAG}" --notes-file notes.md
+```
+
+**判断 Release 有没有真的公开，只信匿名请求**：`GET /repos/{o}/{r}/releases/tags/{tag}`
+返回 404 就是没公开。带 token 的 `gh` 说「存在」说明不了任何事。
 
 ## 14. 读 CI：手上没有 token 时怎么办
 
